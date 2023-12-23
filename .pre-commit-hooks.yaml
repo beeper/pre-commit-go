@@ -1,0 +1,7 @@
+- id: zerolog-ban-msgf
+  name: zerolog-ban-msgf
+  description: Ban use of Msgf() in zerolog
+  entry: banmsgf
+  language: golang
+  types_or:
+    - go
