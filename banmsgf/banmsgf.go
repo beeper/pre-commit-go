@@ -67,6 +67,7 @@ func main() {
 		if len(positions) == 0 {
 			continue
 		}
+		found_msgf = true
 
 		contents, err := os.ReadFile(file)
 		if err != nil {
@@ -74,12 +75,18 @@ func main() {
 		}
 		lines := bytes.Split(contents, []byte("\n"))
 
-		fmt.Printf("\n%s%s:%s\n", COLOR_BOLD, file, COLOR_RESET)
+		fmt.Printf("\n%s%s%s\n", COLOR_BOLD, file, COLOR_RESET)
 		for _, pos := range positions {
-			line := lines[pos.Line-1]
-			msgfIdx := bytes.Index(line, []byte("Msgf"))
-			found_msgf = true
-			fmt.Printf("%d: %s%s%sMsgf%s%s\n", pos.Line, line[:msgfIdx], COLOR_BOLD, COLOR_RED, COLOR_RESET, line[msgfIdx+4:])
+			// We have to search forward since if the Msgf is on its own line,
+			// the position will be for a line above it.
+			for lineIdx := pos.Line - 1; lineIdx < len(lines); lineIdx++ {
+				line := lines[lineIdx]
+				msgfIdx := bytes.Index(line, []byte("Msgf"))
+				if msgfIdx > -1 {
+					fmt.Printf("%d: %s%s%sMsgf%s%s\n", lineIdx+1, line[:msgfIdx], COLOR_BOLD, COLOR_RED, COLOR_RESET, line[msgfIdx+4:])
+					break
+				}
+			}
 		}
 	}
 
