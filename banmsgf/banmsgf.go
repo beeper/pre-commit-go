@@ -7,8 +7,9 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
-	"slices"
 	"strings"
+
+	"golang.org/x/exp/slices"
 )
 
 const (
