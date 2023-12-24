@@ -78,6 +78,7 @@ func main() {
 		for _, pos := range positions {
 			line := lines[pos.Line-1]
 			msgfIdx := bytes.Index(line, []byte("Msgf"))
+			found_msgf = true
 			fmt.Printf("%d: %s%s%sMsgf%s%s\n", pos.Line, line[:msgfIdx], COLOR_BOLD, COLOR_RED, COLOR_RESET, line[msgfIdx+4:])
 		}
 	}
