@@ -74,7 +74,7 @@ func main() {
 		}
 		lines := bytes.Split(contents, []byte("\n"))
 
-		fmt.Printf("%s%s:%s\n", COLOR_BOLD, file, COLOR_RESET)
+		fmt.Printf("\n%s%s:%s\n", COLOR_BOLD, file, COLOR_RESET)
 		for _, pos := range positions {
 			line := lines[pos.Line-1]
 			msgfIdx := bytes.Index(line, []byte("Msgf"))
