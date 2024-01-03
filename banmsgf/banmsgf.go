@@ -56,7 +56,7 @@ func checkFile(filename string) (msgfPositions []token.Position) {
 }
 
 func main() {
-	found_msgf := false
+	var found_msgf bool
 	msgfLines := map[string][]token.Position{}
 	for _, file := range os.Args[1:] {
 		msgfLines[file] = checkFile(file)

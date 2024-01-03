@@ -3,5 +3,10 @@
   description: Ban use of Msgf() in zerolog
   entry: banmsgf
   language: golang
-  types_or:
-    - go
+  types_or: [ go ]
+- id: zerolog-use-stringer
+  name: zerolog-use-stringer
+  description: Use Stringer(x, y) instead of Str(x, y.String())
+  entry: usestringer
+  language: golang
+  types_or: [ go ]
