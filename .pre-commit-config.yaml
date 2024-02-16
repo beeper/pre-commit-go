@@ -13,3 +13,10 @@ repos:
     hooks:
       - id: go-imports-repo
       - id: go-vet-repo-mod
+
+  - repo: https://github.com/beeper/pre-commit-go
+    rev: v0.3.0
+    hooks:
+      - id: zerolog-ban-msgf
+      - id: zerolog-use-stringer
+      - id: prevent-literal-http-methods

@@ -10,3 +10,9 @@
   entry: usestringer
   language: golang
   types_or: [ go ]
+- id: prevent-literal-http-methods
+  name: prevent-literal-http-methods
+  description: Prevent the use of literal strings where http.Method* could be used instead
+  entry: httpmethods
+  language: golang
+  types_or: [ go ]
