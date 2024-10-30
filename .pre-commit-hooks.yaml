@@ -16,3 +16,9 @@
   entry: httpmethods
   language: golang
   types_or: [ go ]
+- id: zerolog-ban-global-log
+  name: zerolog-ban-global-log
+  description: Prevent the use of the global github.com/rs/zerolog/log package
+  entry: banglobalzerolog
+  language: golang
+  types_or: [ go ]
