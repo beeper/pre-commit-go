@@ -17,7 +17,7 @@ const (
 	COLOR_RESET = "\033[0m"
 )
 
-func checkFile(filename string) (msgfPositions []token.Position) {
+func checkFile(filename string) (msgfPositions []token.Position, ignoreLines []int) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, filename, nil, parser.ParseComments)
 	if err != nil {
@@ -36,37 +36,26 @@ func checkFile(filename string) (msgfPositions []token.Position) {
 		return true
 	})
 
-	ignoreLines := map[int]struct{}{}
 	for _, comment := range f.Comments {
 		if strings.Contains(comment.Text(), "zerolog-allow-msgf") {
-			commentLine := fset.Position(comment.Pos()).Line
-			ignoreLines[commentLine] = struct{}{}
+			ignoreLines = append(ignoreLines, fset.Position(comment.Pos()).Line)
 		}
 	}
-
-	if len(ignoreLines) == 0 {
-		return msgfPositions
-	}
-
-	msgfPositions = slices.DeleteFunc(msgfPositions, func(pos token.Position) bool {
-		_, ok := ignoreLines[pos.Line]
-		return ok
-	})
 	return
 }
 
 func main() {
 	var found_msgf bool
 	msgfLines := map[string][]token.Position{}
+	ignoreLines := map[string][]int{}
 	for _, file := range os.Args[1:] {
-		msgfLines[file] = checkFile(file)
+		msgfLines[file], ignoreLines[file] = checkFile(file)
 	}
 
 	for file, positions := range msgfLines {
 		if len(positions) == 0 {
 			continue
 		}
-		found_msgf = true
 
 		contents, err := os.ReadFile(file)
 		if err != nil {
@@ -74,14 +63,19 @@ func main() {
 		}
 		lines := bytes.Split(contents, []byte("\n"))
 
-		fmt.Printf("\n%s%s%s\n", COLOR_BOLD, file, COLOR_RESET)
+		firstErrForFile := true
 		for _, pos := range positions {
 			// We have to search forward since if the Msgf is on its own line,
 			// the position will be for a line above it.
 			for lineIdx := pos.Line - 1; lineIdx < len(lines); lineIdx++ {
 				line := lines[lineIdx]
 				msgfIdx := bytes.Index(line, []byte("Msgf"))
-				if msgfIdx > -1 {
+				if msgfIdx > -1 && !slices.Contains(ignoreLines[file], lineIdx+1) {
+					if firstErrForFile {
+						fmt.Printf("\n%s%s%s\n", COLOR_BOLD, file, COLOR_RESET)
+						firstErrForFile = false
+					}
+					found_msgf = true
 					fmt.Printf("%d: %s%s%sMsgf%s%s\n", lineIdx+1, line[:msgfIdx], COLOR_BOLD, COLOR_RED, COLOR_RESET, line[msgfIdx+4:])
 					break
 				}
