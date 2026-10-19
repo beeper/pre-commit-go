@@ -110,9 +110,8 @@ An error counts as a raw network error when it comes from:
   This needs module mode, which is how the hook and `bridgelint ./...` run.
 
 Plain `errors.New`/`fmt.Errorf` errors that don't wrap a network error are treated as internal
-invariants (bad portal IDs, impossible states) and aren't reported, except where the text itself shows
-a permanent rejection (MSS002) or the error is about the login flow ID, which comes from the client
-(LP001).
+invariants (bad portal IDs, impossible states) and aren't reported, except when `CreateLogin` returns
+one to reject a flow ID (LP001). Error rules don't match on error message text.
 
 Rules that depend on newer bridgev2 behaviour check the module's `maunium.net/go/mautrix` version (from
 `go list -m`) and stay quiet when the pinned version doesn't have it.
@@ -127,7 +126,7 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 | Rule | Severity | Flags |
 |---|---|---|
 | MSS001 | error | A handler returns a network error unmapped: as is, or wrapped in `fmt.Errorf`, directly or through a same-package helper. |
-| MSS002 | error | A permanent rejection stays retriable: `ErrorReason` `Unsupported`/`NoPermission`/`TooOld` without `WithStatus(event.MessageStatusFail)`, or a plain error whose text says it's permanent ("not supported", "too large", "only your own", "not allowed"…). A status with `WithIsCertain(false)` isn't judged by its text. |
+| MSS002 | error | A permanent rejection stays retriable: `ErrorReason` `Unsupported`/`NoPermission`/`TooOld` without `WithStatus(event.MessageStatusFail)`. |
 | MSS003 | warning | Raw error text shown to users: `WithErrorAsMessage()` on a library error or on `fmt.Errorf` that formats another error or status code, or `WithMessage(err.Error())`. |
 | MSS004 | warning | `WithIsCertain(true)` on a timeout. |
 | MSS005 | info | A `MessageStatus` literal with a message and certainty but no `ErrorReason` (`WrapErrorInStatus` already defaults it to `GenericError`). |
@@ -138,17 +137,13 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 | Rule | Severity | Flags |
 |---|---|---|
 | BS001 | info | An explicit `UserActionRelogin` on `BAD_CREDENTIALS`, when the pinned mautrix already defaults to it (after v0.32.0). |
-| BS002 | error | A restriction, ban, checkpoint or consent code that isn't `BAD_CREDENTIALS` + `OPEN_NATIVE`, or `UserActionRestart` with `BAD_CREDENTIALS`. Autofix sets `OPEN_NATIVE`. |
+| BS002 | error | A restriction code that isn't `BAD_CREDENTIALS` + `OPEN_NATIVE`, or `UserActionRestart` with `BAD_CREDENTIALS`. A restriction code contains one of these whole words (the code is split on anything that isn't a letter or digit): ban(ned), suspend(ed), suspension, restrict(ed), restriction, lock(ed), lockout, checkpoint, consent, challenge, disabled, deactivate(d), or the pairs access-denied, not-offered. Autofix sets `OPEN_NATIVE`. |
 | BS003 | error | `Message` built from `err.Error()` or `fmt.Sprintf(..., err)`. Warning when the code has a `BridgeStateHumanErrors` entry, since the text is then silently discarded. |
 | BS004 | error | An error state with no `Error` code, a code that doesn't match `<error_prefix>-<reason>`, or a code built with `fmt.Sprintf`. |
 | BS005 | warning | A code with no `Message` and no `BridgeStateHumanErrors` entry anywhere in the linted packages. |
-| BS007 | error | In `Connect` or a goroutine, `TRANSIENT_DISCONNECT` followed by `return`/`break` with nothing scheduling a reconnect. |
 | BS009 | warning | An event-handler type switch for a configured library with no case for its disconnect events. |
 | BS010 | warning | `TRANSIENT_DISCONNECT` under a 401/403/auth check. |
 | BS011 | warning | `BAD_CREDENTIALS` for every connect error: in a `default`/`else` branch, or directly under `if err != nil` after a `Connect` call. |
-
-`UNKNOWN_ERROR` followed by `return` isn't flagged by BS007: bridgev2 reconnects automatically on
-`UNKNOWN_ERROR`.
 
 ### Login and provisioning (LP)
 
@@ -163,9 +158,8 @@ phone, for example) asks for retries deliberately and isn't reported.
 
 | Rule | Severity | Flags |
 |---|---|---|
-| LP001 | error | A login or provisioning method returns a network error, or `CreateLogin` returns a plain error about the flow ID, instead of a `bridgev2.RespError`. Other plain errors aren't reported: their text can't tell bad input from an internal invariant. |
-| LP002 | error | A rate-limit `RespError` (`M_LIMIT_EXCEEDED`, or "rate limit"/"too many requests"/"flood"/"slow down") sent as 429, including `mautrix.MLimitExceeded.WithMessage(...)` without `WithStatus`. Autofix sets 400. |
-| LP003 | error | Any other `RespError` with status 429, 502, 503 or 504. |
+| LP001 | error | A login or provisioning method returns a network error instead of a `bridgev2.RespError`, or `CreateLogin` returns a plain error directly in the `default` of a `switch` on the flow ID or in an `if` on it. Other plain errors aren't reported: nothing distinguishes bad input from an internal invariant. |
+| LP002 | error | A `RespError` with status 429, 502, 503 or 504, including `mautrix.MLimitExceeded` without `WithStatus` (429 by default). Autofix sets 400 when the code is `M_LIMIT_EXCEEDED`. |
 | LP004 | warning | A `RespError` status copied from a network error code (`StatusCode: te.Code`). |
 | LP005 | warning | A `RespError` literal without `StatusCode`, which is sent as 500. |
 | LP007 | info | A `RespError` literal for a standard Matrix code; use `mautrix.MLimitExceeded.WithMessage(...)` and friends so the status can't drift from the code. Autofix rewrites it. |
@@ -197,6 +191,10 @@ phone, for example) asks for retries deliberately and isn't reported.
 
 These were considered and left out because they can't be checked without false positives:
 
+- Permanent rejections recognised from error text ("not supported", "too large"): wording varies and
+  doesn't say whether the author meant it to be retriable.
+- Giving up after `TRANSIENT_DISCONNECT` with nothing scheduling a reconnect: whether something retries
+  isn't visible without guessing from function names.
 - Failures that are only logged in a background loop ("dead but green"): whether a loop is a
   connection loop or batch work, and whether something else reports the failure, isn't visible
   statically.

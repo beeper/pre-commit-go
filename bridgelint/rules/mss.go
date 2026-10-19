@@ -19,8 +19,6 @@ var MSSAnalyzer = &analysis.Analyzer{
 	FactTypes: []analysis.Fact{new(mssErrFact)},
 }
 
-var permanentRegex = regexp.MustCompile(`(?i)not supported|unsupported|(doesn't|does not|don't|do not) support|too (large|long|big)|exceeds the|only (your|their) own|not allowed|(can't|cannot) be (sent|edited|deleted|used)`)
-
 var classifierNameRegex = regexp.MustCompile(`(?i)(code|kind|class|reason|status)`)
 
 var permanentReasons = map[string]bool{
@@ -52,10 +50,6 @@ func runMSS(pass *analysis.Pass) (any, error) {
 		ef.returnedErrors(fd, idx, func(ret *ast.ReturnStmt, o errOrigin) {
 			switch o.kind {
 			case errConstructed:
-				if o.msg != "" && permanentRegex.MatchString(o.msg) {
-					report(pass, ret, MSS002, fmt.Sprintf("%s returns %s, which reads as permanent but becomes a retriable status; return WrapErrorInStatus(...) with an ErrorReason and WithStatus(event.MessageStatusFail)", fd.Name.Name, describeOrigin(pass.Fset, o)))
-					return
-				}
 				if !o.hasCallee() {
 					// A plain error that wraps nothing from the network is usually an internal
 					// invariant; a generic failure status is fine for those.
@@ -95,20 +89,8 @@ func checkStatusChain(pass *analysis.Pass, ef *errFlow, c *statusChain) {
 
 	// MSS002
 	if c.known && !c.hasStatus() {
-		reason, hasReason := c.reason(info)
-		var msg string
-		if m, ok := c.message(); ok {
-			msg, _ = constString(info, m)
-		} else if innerOrigin.kind == errConstructed {
-			msg = innerOrigin.msg
-		}
-		switch {
-		case hasReason && permanentReasons[reason]:
+		if reason, ok := c.reason(info); ok && permanentReasons[reason] {
 			report(pass, c.node(), MSS002, fmt.Sprintf("status has ErrorReason %s but no WithStatus(event.MessageStatusFail), so clients offer a retry that can't work", reason))
-		// WithIsCertain(false) means the message may have been sent, so the author doesn't consider it a
-		// permanent rejection whatever the text says.
-		case msg != "" && permanentRegex.MatchString(msg) && !(hasReason && (reason == "MessageStatusNetworkError" || reason == "MessageStatusBridgeUnavailable")) && !explicitlyUncertain(info, c):
-			report(pass, c.node(), MSS002, fmt.Sprintf("status %q reads as permanent but stays retriable; add WithStatus(event.MessageStatusFail) and an ErrorReason", msg))
 		}
 	}
 
@@ -316,9 +298,4 @@ func hasCtxDoneCase(pi *pkgInfo, cc *ast.CommClause) bool {
 		}
 	}
 	return false
-}
-
-func explicitlyUncertain(info *types.Info, c *statusChain) bool {
-	certain, ok := c.certain(info)
-	return ok && !certain
 }

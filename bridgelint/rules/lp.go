@@ -5,7 +5,6 @@ import (
 	"go/ast"
 	"go/constant"
 	"go/types"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -20,23 +19,11 @@ var LPAnalyzer = &analysis.Analyzer{
 	FactTypes: []analysis.Fact{new(lpErrFact)},
 }
 
-var (
-	rateLimitRegex = regexp.MustCompile(`(?i)rate.?limit|too many (requests|attempts|tries)|flood|slow ?down`)
-	// userInputRegex matches plain login/provisioning errors that describe bad user input, which should be 4xx.
-	// Other plain errors are treated as internal invariants and not reported.
-	// flowRegex matches CreateLogin errors about the flow ID, which comes straight from the client.
-	// Other plain errors can't be told apart from internal invariants by their text, so they aren't reported.
-	flowRegex = regexp.MustCompile(`(?i)\bflow\b`)
-)
-
 // autoRetriedStatuses are the HTTP statuses that clients (mautrix-go's retryafter.Should, and the Beeper
 // clients) retry automatically. Login and provisioning requests must not be retried behind the user's back.
 var autoRetriedStatuses = map[int64]bool{429: true, 502: true, 503: true, 504: true}
 
-const (
-	lp002Msg = "rate limit RespError is sent as HTTP 429, which clients retry automatically; use 400 (the M_LIMIT_EXCEEDED code still says it's a rate limit)"
-	lp003Fmt = "RespError is sent as HTTP %d, which clients retry automatically; use 500 for upstream failures or a 4xx for rejections"
-)
+const lp002Fmt = "RespError is sent as HTTP %d, which clients retry automatically; use 400 with M_LIMIT_EXCEEDED for rate limits, 500 for upstream failures or another 4xx for rejections"
 
 // standardCodes maps standard Matrix error codes to their mautrix.RespError variables and default statuses.
 var standardCodes = map[string]struct {
@@ -103,7 +90,7 @@ func runLP(pass *analysis.Pass) (any, error) {
 			continue
 		}
 		ef.returnedErrors(fd, idx, func(ret *ast.ReturnStmt, o errOrigin) {
-			if o.kind == errRaw || o.kind == errConstructed && (o.hasCallee() || isUnknownFlowError(pi, fd, o)) {
+			if o.kind == errRaw || o.kind == errConstructed && (o.hasCallee() || isFlowRejection(pass, pi, fd, ret)) {
 				report(pass, ret, LP001, fmt.Sprintf("%s returns %s, which reaches clients as a bare 500 M_UNKNOWN; return a bridgev2.RespError with a matching status (or wrap with bridgev2.WrapRespErr)", fd.Name.Name, describeOrigin(pass.Fset, o)))
 			}
 		})
@@ -184,15 +171,9 @@ func standardVarSelector(info *types.Info, e ast.Expr) (string, bool) {
 func checkRespErrLit(pass *analysis.Pass, pi *pkgInfo, file *ast.File, lit *ast.CompositeLit) {
 	info := pass.TypesInfo
 	re := parseRespErrLit(info, lit)
-	isRate := re.code == "M_LIMIT_EXCEEDED" || rateLimitRegex.MatchString(re.msg) || rateLimitRegex.MatchString(re.code)
-
-	// LP002, LP003
-	if re.statusKnow && autoRetriedStatuses[re.statusVal] && !isTrue(info, re.fields["CanRetry"]) && !explicitlyRetriable(pi, info, lit) {
-		if isRate && re.statusVal == 429 {
-			report(pass, re.status, LP002, lp002Msg, withFix("Use 400", analysis.TextEdit{Pos: re.status.Pos(), End: re.status.End(), NewText: []byte(statusBadRequest(file))}))
-		} else {
-			report(pass, re.status, LP003, fmt.Sprintf(lp003Fmt, re.statusVal))
-		}
+	// LP002
+	if re.statusKnow && !isTrue(info, re.fields["CanRetry"]) && !explicitlyRetriable(pi, info, lit) {
+		checkStatusArg(pass, file, re.status, re.statusVal, re.code == "M_LIMIT_EXCEEDED")
 	}
 
 	// LP004
@@ -286,13 +267,13 @@ func isPassthroughStatus(info *types.Info, e ast.Expr) bool {
 	return strings.Contains(name, "code") || strings.Contains(name, "status")
 }
 
-// checkRespErrCall handles mautrix.MX.WithStatus(...) chains and WrapRespErrManual (LP002, LP003, LP004).
+// checkRespErrCall handles mautrix.MX.WithStatus(...) chains and WrapRespErrManual (LP002, LP004).
 func checkRespErrCall(pass *analysis.Pass, pi *pkgInfo, file *ast.File, call *ast.CallExpr) {
 	info := pass.TypesInfo
 	if isPkgFunc(calleeObj(info, call), pathBridgev2, "WrapRespErrManual") && len(call.Args) == 3 {
 		code, _ := constString(info, call.Args[1])
 		if v, ok := constInt(info, call.Args[2]); ok {
-			checkStatusArg(pass, file, call.Args[2], v, code == "M_LIMIT_EXCEEDED" || rateLimitRegex.MatchString(code))
+			checkStatusArg(pass, file, call.Args[2], v, code == "M_LIMIT_EXCEEDED")
 		} else if isPassthroughStatus(info, call.Args[2]) {
 			report(pass, call.Args[2], LP004, "HTTP status copied from a network error code; map it to a fixed status")
 		}
@@ -312,35 +293,37 @@ func checkRespErrCall(pass *analysis.Pass, pi *pkgInfo, file *ast.File, call *as
 	if explicitlyRetriable(pi, info, call) {
 		return
 	}
-	isRate := false
+	isLimit := false
 	ast.Inspect(sel.X, func(n ast.Node) bool {
-		if id, ok := n.(*ast.Ident); ok && id.Name == "MLimitExceeded" {
-			isRate = true
+		if id, ok := n.(*ast.Ident); ok && isMautrixVar(info.Uses[id], "MLimitExceeded") {
+			isLimit = true
 		}
-		if lit, ok := n.(*ast.BasicLit); ok && rateLimitRegex.MatchString(lit.Value) {
-			isRate = true
-		}
-		return !isRate
+		return !isLimit
 	})
-	checkStatusArg(pass, file, call.Args[0], v, isRate)
+	checkStatusArg(pass, file, call.Args[0], v, isLimit)
 }
 
-func checkStatusArg(pass *analysis.Pass, file *ast.File, arg ast.Expr, v int64, isRate bool) {
+// checkStatusArg implements LP002 for a constant status. The autofix to 400 is only offered when the code
+// is M_LIMIT_EXCEEDED, which still tells the client it was rate limited.
+func checkStatusArg(pass *analysis.Pass, file *ast.File, arg ast.Expr, v int64, isLimit bool) {
 	if !autoRetriedStatuses[v] {
 		return
 	}
-	if isRate && v == 429 {
-		report(pass, arg, LP002, lp002Msg, withFix("Use 400", analysis.TextEdit{Pos: arg.Pos(), End: arg.End(), NewText: []byte(statusBadRequest(file))}))
-	} else {
-		report(pass, arg, LP003, fmt.Sprintf(lp003Fmt, v))
+	var opts []reportOpt
+	if isLimit && v == 429 {
+		opts = append(opts, withFix("Use 400", analysis.TextEdit{Pos: arg.Pos(), End: arg.End(), NewText: []byte(statusBadRequest(file))}))
 	}
+	report(pass, arg, LP002, fmt.Sprintf(lp002Fmt, v), opts...)
+}
+
+func isMautrixVar(obj types.Object, name string) bool {
+	return obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == pathMautrix && obj.Name() == name
 }
 
 // checkDefaultLimitExceeded implements LP002 for mautrix.MLimitExceeded used as a RespError without
 // WithStatus, which keeps its default status of 429. Plain references (errors.Is targets) aren't reported.
 func checkDefaultLimitExceeded(pass *analysis.Pass, pi *pkgInfo, file *ast.File, sel *ast.SelectorExpr) {
-	obj := pass.TypesInfo.Uses[sel.Sel]
-	if obj == nil || obj.Pkg() == nil || obj.Pkg().Path() != pathMautrix || obj.Name() != "MLimitExceeded" {
+	if !isMautrixVar(pass.TypesInfo.Uses[sel.Sel], "MLimitExceeded") {
 		return
 	}
 	var outer ast.Expr = sel
@@ -373,8 +356,40 @@ func checkDefaultLimitExceeded(pass *analysis.Pass, pi *pkgInfo, file *ast.File,
 		withFix("Use 400", analysis.TextEdit{Pos: outer.End(), End: outer.End(), NewText: []byte(".WithStatus(" + statusBadRequest(file) + ")")}))
 }
 
-func isUnknownFlowError(pi *pkgInfo, fd *ast.FuncDecl, o errOrigin) bool {
-	return fd.Name.Name == "CreateLogin" && pi.scopes[fd]&ScopeLogin != 0 && flowRegex.MatchString(o.msg)
+// isFlowRejection reports whether ret is how CreateLogin rejects a flow ID it doesn't know: it's directly
+// in the default clause of a switch on the flow ID, or directly in the body or else branch of an if whose
+// condition uses it. The flow ID comes straight from the client, so that error should be a 4xx.
+func isFlowRejection(pass *analysis.Pass, pi *pkgInfo, fd *ast.FuncDecl, ret *ast.ReturnStmt) bool {
+	if fd.Name.Name != "CreateLogin" || pi.scopes[fd]&ScopeLogin == 0 {
+		return false
+	}
+	sig := funcType(pass.TypesInfo, fd)
+	if sig == nil || sig.Params().Len() == 0 {
+		return false
+	}
+	flowID := sig.Params().At(sig.Params().Len() - 1)
+	if basic, ok := flowID.Type().(*types.Basic); !ok || basic.Kind() != types.String {
+		return false
+	}
+	usesFlowID := func(e ast.Node) bool {
+		found := false
+		ast.Inspect(e, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && pass.TypesInfo.Uses[id] == flowID {
+				found = true
+			}
+			return !found
+		})
+		return found
+	}
+	switch parent := pi.parents[ret].(type) {
+	case *ast.CaseClause:
+		sw, ok := pi.parents[pi.parents[parent]].(*ast.SwitchStmt)
+		return ok && parent.List == nil && sw.Tag != nil && usesFlowID(sw.Tag)
+	case *ast.BlockStmt:
+		ifs, ok := pi.parents[parent].(*ast.IfStmt)
+		return ok && usesFlowID(ifs.Cond)
+	}
+	return false
 }
 
 // checkDuplicateValidation implements LP008.

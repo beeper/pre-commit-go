@@ -52,10 +52,17 @@ var _ bridgev2.NetworkConnector = (*Connector)(nil)
 
 func (c *Connector) GetLoginFlows() []bridgev2.LoginFlow { return nil }
 func (c *Connector) CreateLogin(ctx context.Context, user any, flowID string) (bridgev2.LoginProcess, error) {
-	if flowID != "token" {
-		return nil, errors.New("unknown flow") // want `LP001: CreateLogin returns plain error "unknown flow"`
+	switch flowID {
+	case "nested":
+		if c == nil {
+			return nil, errors.New("connector is missing")
+		}
+		return &TokenLogin{}, nil
+	case "token":
+		return &TokenLogin{}, nil
+	default:
+		return nil, errors.New("this login isn't available") // want `LP001: CreateLogin returns plain error "this login isn't available"`
 	}
-	return &TokenLogin{}, nil
 }
 
 type TokenLogin struct{}
@@ -77,17 +84,17 @@ func (t *TokenLogin) SubmitUserInput(ctx context.Context, input map[string]strin
 
 var (
 	ErrInvalidToken  = bridgev2.RespError{ErrCode: "FI.MAU.EX.INVALID_TOKEN", Err: "Invalid token", StatusCode: http.StatusBadRequest}
-	ErrRateLimited   = bridgev2.RespError{ErrCode: "FI.MAU.EX.RATE_LIMITED", Err: "Too many requests", StatusCode: http.StatusTooManyRequests} // want `LP002: rate limit RespError is sent as HTTP 429`
+	ErrRateLimited   = bridgev2.RespError{ErrCode: "FI.MAU.EX.RATE_LIMITED", Err: "Too many requests", StatusCode: http.StatusTooManyRequests} // want `LP002: RespError is sent as HTTP 429`
 	ErrRateLimitedOK = bridgev2.RespError{ErrCode: "FI.MAU.EX.RATE_LIMITED", Err: "Too many requests", StatusCode: http.StatusBadRequest}
 	ErrNoStatus      = bridgev2.RespError{ErrCode: "FI.MAU.EX.CAPTCHA", Err: "Captcha required"}                                                  // want `LP005: RespError literal without StatusCode`
-	ErrOutage        = bridgev2.RespError{ErrCode: "FI.MAU.EX.TEMPORARY_FAILURE", Err: "Server error", StatusCode: http.StatusServiceUnavailable} // want `LP003: RespError is sent as HTTP 503`
-	ErrUpstream      = bridgev2.RespError(mautrix.MUnknown.WithMessage("Upstream failed").WithStatus(502))                                        // want `LP003: RespError is sent as HTTP 502`
+	ErrOutage        = bridgev2.RespError{ErrCode: "FI.MAU.EX.TEMPORARY_FAILURE", Err: "Server error", StatusCode: http.StatusServiceUnavailable} // want `LP002: RespError is sent as HTTP 503`
+	ErrUpstream      = bridgev2.RespError(mautrix.MUnknown.WithMessage("Upstream failed").WithStatus(502))                                        // want `LP002: RespError is sent as HTTP 502`
 	ErrUpstreamOK    = bridgev2.RespError(mautrix.MUnknown.WithMessage("Upstream failed"))
 	ErrPhoneTimeout  = mautrix.MNotFound.WithMessage("Phone did not respond").WithStatus(http.StatusGatewayTimeout).WithCanRetry(true)
 	ErrLimit         = mautrix.RespError{ErrCode: "M_LIMIT_EXCEEDED", Err: "Slow down", StatusCode: http.StatusBadRequest} // want `LP007: RespError literal for M_LIMIT_EXCEEDED`
 	ErrForbidden     = bridgev2.RespError{ErrCode: mautrix.MForbidden.ErrCode, Err: "Not allowed", StatusCode: 403}        // want `LP007: RespError literal for M_FORBIDDEN`
 	ErrLockedOut     = bridgev2.RespError{ErrCode: "FI.MAU.EX.LOCKED", Err: "Too many incorrect attempts, temporarily locked", StatusCode: 403}
-	ErrLimit2        = mautrix.MLimitExceeded.WithStatus(429)                              // want `LP002: rate limit RespError is sent as HTTP 429`
+	ErrLimit2        = mautrix.MLimitExceeded.WithStatus(429)                              // want `LP002: RespError is sent as HTTP 429`
 	ErrLimit3        = bridgev2.RespError(mautrix.MLimitExceeded.WithMessage("Slow down")) // want `LP002: mautrix.MLimitExceeded is sent as HTTP 429 by default`
 	ErrLimit4        = mautrix.MLimitExceeded.WithMessage("Slow down").WithStatus(http.StatusBadRequest)
 )

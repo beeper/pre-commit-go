@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
 
 	"golang.org/x/tools/go/analysis"
 )
@@ -26,10 +27,8 @@ var BSAnalyzer = &analysis.Analyzer{
 }
 
 var (
-	restrictionRegex    = regexp.MustCompile(`(?i)ban|banned|suspend|restrict|lock|checkpoint|consent|challenge|disabled|deactivat|access.?denied|not.?offered`)
-	restrictionFixRegex = regexp.MustCompile(`(?i)ban|suspend|restrict|locked|checkpoint`)
-	eventTypeNameRegex  = regexp.MustCompile(`(Event|Create|Update|Delete|Ready|Connect|Disconnect)$`)
-	authCondRegex       = regexp.MustCompile(`(?i)\b40[13]\b|StatusUnauthorized|StatusForbidden|Unauthori[sz]ed|Forbidden|AuthError|InvalidAuth|BadCredentials`)
+	eventTypeNameRegex = regexp.MustCompile(`(Event|Create|Update|Delete|Ready|Connect|Disconnect)$`)
+	authCondRegex      = regexp.MustCompile(`(?i)\b40[13]\b|StatusUnauthorized|StatusForbidden|Unauthori[sz]ed|Forbidden|AuthError|InvalidAuth|BadCredentials`)
 )
 
 type stateLit struct {
@@ -195,10 +194,10 @@ func checkStateLit(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, s
 	}
 
 	// BS002
-	if sl.codeOK && restrictionRegex.MatchString(sl.code) && !(sl.event == "BAD_CREDENTIALS" && sl.action == "OPEN_NATIVE") && sl.event != "" {
+	if sl.codeOK && isRestrictionCode(sl.code) && !(sl.event == "BAD_CREDENTIALS" && sl.action == "OPEN_NATIVE") && sl.event != "" {
 		msg := fmt.Sprintf("%q looks like a restriction or ban but is sent as %s", sl.code, describeState(sl))
 		var opts []reportOpt
-		if sl.event == "BAD_CREDENTIALS" && (sl.action == "RESTART" || restrictionFixRegex.MatchString(sl.code)) {
+		if sl.event == "BAD_CREDENTIALS" && (sl.action == "RESTART" || hasCodeWord(sl.code, restrictionFixWords)) {
 			opts = append(opts, userActionFix(pass, sl))
 		}
 		report(pass, lit, BS002, msg+"; restrictions are BAD_CREDENTIALS with UserAction OPEN_NATIVE", opts...)
@@ -242,13 +241,6 @@ func checkStateLit(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, s
 
 	if sl.fn == nil {
 		return
-	}
-
-	// BS007
-	if sl.event == "TRANSIENT_DISCONNECT" && isLifecycle(pi, sl.fn) {
-		if next := nextStmtAfter(pi, lit); next != nil && exitsFunctionOrLoop(next) && !hasRetrySignal(pass, funcBody(sl.fn)) {
-			report(pass, lit, BS007, "TRANSIENT_DISCONNECT followed by giving up, with nothing scheduling a reconnect; the login stays disconnected until a restart. Retry with backoff, or send UNKNOWN_ERROR so the framework reconnects")
-		}
 	}
 
 	// BS010
@@ -343,73 +335,6 @@ func sprintfFormat(info *types.Info, e ast.Expr) (string, bool) {
 func isEmptyString(info *types.Info, e ast.Expr) bool {
 	s, ok := constString(info, e)
 	return ok && s == ""
-}
-
-func isLifecycle(pi *pkgInfo, fn ast.Node) bool {
-	switch f := fn.(type) {
-	case *ast.FuncDecl:
-		return pi.scopes[f]&ScopeLifecycle != 0 || pi.goTargets[f]
-	case *ast.FuncLit:
-		return slices.Contains(pi.goLits, f)
-	}
-	return false
-}
-
-// nextStmtAfter returns the statement following the one that contains n, in the same block.
-func nextStmtAfter(pi *pkgInfo, n ast.Node) ast.Stmt {
-	var child ast.Node = n
-	for p := pi.parents[n]; p != nil; child, p = p, pi.parents[p] {
-		switch x := p.(type) {
-		case *ast.FuncDecl, *ast.FuncLit:
-			return nil
-		case *ast.BlockStmt:
-			for i, s := range x.List {
-				if s == child && i+1 < len(x.List) {
-					return x.List[i+1]
-				}
-			}
-			return nil
-		case *ast.CaseClause:
-			for i, s := range x.Body {
-				if s == child && i+1 < len(x.Body) {
-					return x.Body[i+1]
-				}
-			}
-			return nil
-		}
-	}
-	return nil
-}
-
-func exitsFunctionOrLoop(s ast.Stmt) bool {
-	switch x := s.(type) {
-	case *ast.ReturnStmt:
-		return true
-	case *ast.BranchStmt:
-		return x.Tok == token.BREAK || x.Tok == token.GOTO
-	}
-	return false
-}
-
-var retryNameRegex = regexp.MustCompile(`(?i)reconnect|retry|backoff|restart`)
-
-func hasRetrySignal(pass *analysis.Pass, body ast.Node) bool {
-	found := false
-	ast.Inspect(body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return !found
-		}
-		obj := calleeObj(pass.TypesInfo, call)
-		if isPkgFunc(obj, "time", "AfterFunc") {
-			found = true
-		}
-		if obj != nil && retryNameRegex.MatchString(obj.Name()) {
-			found = true
-		}
-		return !found
-	})
-	return found
 }
 
 func enclosingCondText(pass *analysis.Pass, pi *pkgInfo, n ast.Node) string {
@@ -553,4 +478,52 @@ func typeNameIn(t types.Type, pkg *types.Package) string {
 		return ""
 	}
 	return prefix + n.Obj().Name()
+}
+
+// restrictionWords are the whole words in a state code (split on anything that isn't a letter or digit)
+// that mark an account restriction the user fixes on the network.
+var restrictionWords = map[string]bool{
+	"ban": true, "banned": true, "suspend": true, "suspended": true, "suspension": true,
+	"restrict": true, "restricted": true, "restriction": true, "lock": true, "locked": true,
+	"lockout": true, "checkpoint": true, "consent": true, "challenge": true, "disabled": true,
+	"deactivate": true, "deactivated": true,
+}
+
+// restrictionPhrases are adjacent word pairs with the same meaning.
+var restrictionPhrases = [][2]string{{"access", "denied"}, {"not", "offered"}}
+
+// restrictionFixWords are the restrictions whose autofix to OPEN_NATIVE is unambiguous.
+var restrictionFixWords = map[string]bool{
+	"ban": true, "banned": true, "suspend": true, "suspended": true, "suspension": true,
+	"restrict": true, "restricted": true, "restriction": true, "locked": true, "checkpoint": true,
+}
+
+func codeWords(code string) []string {
+	return strings.FieldsFunc(strings.ToLower(code), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+}
+
+func hasCodeWord(code string, words map[string]bool) bool {
+	for _, w := range codeWords(code) {
+		if words[w] {
+			return true
+		}
+	}
+	return false
+}
+
+func isRestrictionCode(code string) bool {
+	if hasCodeWord(code, restrictionWords) {
+		return true
+	}
+	words := codeWords(code)
+	for i := 0; i+1 < len(words); i++ {
+		for _, p := range restrictionPhrases {
+			if words[i] == p[0] && words[i+1] == p[1] {
+				return true
+			}
+		}
+	}
+	return false
 }

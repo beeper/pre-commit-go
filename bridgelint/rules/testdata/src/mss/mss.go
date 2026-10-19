@@ -29,13 +29,13 @@ func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMe
 		return nil, errors.New("no message to send")
 	}
 	if len(msg.Content) > 1000 {
-		return nil, fmt.Errorf("message is too long (max %d characters)", 1000) // want `MSS002: HandleMatrixMessage returns plain error .*reads as permanent`
+		return nil, fmt.Errorf("message is too long (max %d characters)", 1000)
 	}
 	if msg.Content == "x" {
 		return nil, bridgev2.ErrMediaTooLarge
 	}
 	if msg.Content == "y" {
-		return nil, errLocalSentinel // want `MSS002: .*errLocalSentinel`
+		return nil, errLocalSentinel
 	}
 	_, err := c.client.Send(ctx, msg.Content)
 	if err != nil {
@@ -97,7 +97,7 @@ func statuses(err error) []error {
 	return []error{
 		bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusUnsupported), // want `MSS002: status has ErrorReason MessageStatusUnsupported but no WithStatus`
 		bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusUnsupported).WithStatus(event.MessageStatusFail).WithIsCertain(true),
-		bridgev2.WrapErrorInStatus(errors.New("stickers are not supported")), // want `MSS002: status "stickers are not supported" reads as permanent`
+		bridgev2.WrapErrorInStatus(errors.New("stickers are not supported")),
 		bridgev2.WrapErrorInStatus(err).WithErrorAsMessage().WithStatus(event.MessageStatusFail).WithErrorReason(event.MessageStatusUnsupported),
 		bridgev2.WrapErrorInStatus(fmt.Errorf("server said %w", err)).WithErrorAsMessage().WithErrorReason(event.MessageStatusNetworkError), // want `MSS003: WithErrorAsMessage shows an error that formats another error`
 		bridgev2.WrapErrorInStatus(err).WithMessage("failed: " + err.Error()).WithErrorReason(event.MessageStatusNetworkError),              // want `MSS003: status message is built from raw error text`

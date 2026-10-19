@@ -45,6 +45,7 @@ func (c *Client) states(err error) {
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "ex-invalid-auth", UserAction: status.UserActionRelogin})                               // want `BS001: BAD_CREDENTIALS already defaults to RELOGIN`
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "ex-account-suspended", Message: "suspended", UserAction: status.UserActionOpenNative}) // want `BS002: "ex-account-suspended" looks like a restriction`
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "ex-checkpoint", Message: "checkpoint", UserAction: status.UserActionOpenNative})       // want `BS002: "ex-checkpoint" looks like a restriction`
+	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateUnknownError, Error: "ex-blocklist-sync-failed", Message: "blocklist sync failed"})
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "ex-banned", Message: "banned", UserAction: status.UserActionOpenNative})
 	c.UserLogin.BridgeState.Send(status.BridgeState{
 		StateEvent: status.StateTransientDisconnect,
@@ -83,7 +84,7 @@ func (c *Client) giveUpLoop(ctx context.Context) {
 			time.Sleep(time.Second)
 		}
 	}
-	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "ex-gave-up", Message: "gave up"}) // want `BS007: TRANSIENT_DISCONNECT followed by giving up`
+	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "ex-gave-up", Message: "gave up"})
 	return
 }
 
