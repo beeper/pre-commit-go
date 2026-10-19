@@ -34,7 +34,7 @@ func runEP(pass *analysis.Pass) (any, error) {
 		ast.Inspect(f, func(n ast.Node) bool {
 			switch x := n.(type) {
 			case *ast.BinaryExpr:
-				if (x.Op == token.EQL || x.Op == token.NEQ) && (isErrText(x.X) || isErrText(x.Y)) {
+				if (x.Op == token.EQL || x.Op == token.NEQ) && (isErrText(x.X) && !isEmptyString(info, x.Y) || isErrText(x.Y) && !isEmptyString(info, x.X)) {
 					report(pass, x, EP001, "error matched by comparing err.Error(); use errors.Is/errors.As or a typed code accessor")
 				}
 			case *ast.SwitchStmt:

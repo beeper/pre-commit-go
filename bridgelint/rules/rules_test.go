@@ -1,6 +1,7 @@
 package rules
 
 import (
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/tools/go/analysis/analysistest"
@@ -33,6 +34,11 @@ func TestFrameworkHas(t *testing.T) {
 		}
 	}
 	MautrixVersion = ""
+}
+
+// TestCrossPackage runs in module mode, where errors are followed into other packages of the module.
+func TestCrossPackage(t *testing.T) {
+	analysistest.Run(t, filepath.Join(analysistest.TestData(), "crossmod"), MSSAnalyzer, "./...")
 }
 
 func TestLP(t *testing.T) {

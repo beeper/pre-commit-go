@@ -274,10 +274,11 @@ func checkExits(pass *analysis.Pass, pi *pkgInfo, f *ast.File) {
 			switch {
 			case isPkgFunc(obj, "os", "Exit"):
 				report(pass, call, GR004, "os.Exit in connector or library code kills every login on the process; return an error instead")
-			case isPkgFunc(obj, "log", "Fatal", "Fatalf", "Fatalln", "Panic", "Panicf", "Panicln"):
+			// Panic variants aren't reported: they're a logged panic, and plain panics aren't either.
+			case isPkgFunc(obj, "log", "Fatal", "Fatalf", "Fatalln"):
 				report(pass, call, GR004, fmt.Sprintf("log.%s in connector or library code kills the process; return an error instead", obj.Name()))
-			case obj != nil && (obj.Name() == "Fatal" || obj.Name() == "Panic") && recvType(obj) != nil && strings.Contains(recvType(obj).String(), "zerolog"):
-				report(pass, call, GR004, fmt.Sprintf("zerolog %s() exits or panics; log at Error and return an error instead", obj.Name()))
+			case obj != nil && obj.Name() == "Fatal" && recvType(obj) != nil && strings.Contains(recvType(obj).String(), "zerolog"):
+				report(pass, call, GR004, "zerolog Fatal() exits the process; log at Error and return an error instead")
 			}
 			return true
 		})

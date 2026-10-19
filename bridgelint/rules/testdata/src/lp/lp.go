@@ -26,7 +26,7 @@ func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMe
 
 func (c *Client) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
 	if identifier == "" {
-		return nil, fmt.Errorf("invalid identifier") // want `LP001: ResolveIdentifier returns plain error "invalid identifier"`
+		return nil, fmt.Errorf("invalid identifier")
 	}
 	if identifier == "bad" {
 		return nil, bridgev2.RespError(mautrix.MInvalidParam.WithMessage("invalid identifier"))

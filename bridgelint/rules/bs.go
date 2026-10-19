@@ -21,6 +21,8 @@ var BSAnalyzer = &analysis.Analyzer{
 	Name: "bs",
 	Doc:  "bridge state rules (BS001-BS011): states must carry the right event, action, code and human message, and failures must not be silent",
 	Run:  runBS,
+
+	FactTypes: []analysis.Fact{new(bsErrFact)},
 }
 
 var (
@@ -43,16 +45,19 @@ type stateLit struct {
 }
 
 func runBS(pass *analysis.Pass) (any, error) {
+	if len(pass.Files) == 0 {
+		return nil, nil
+	}
 	pi := infoFor(pass)
 	keys := CollectHumanErrorKeys(pass.TypesInfo, pass.Files)
 	for k := range ModuleHumanErrorKeys {
 		keys[k] = true
 	}
+	cfg := ConfigFor(pass)
+	ef := newErrFlow(pi, cfg).withFacts(pass, newBSFact)
 	if !pi.isBridge {
 		return nil, nil
 	}
-	cfg := ConfigFor(pass)
-	ef := newErrFlow(pi, cfg)
 	codeShape := regexp.MustCompile(`^` + regexp.QuoteMeta(cfg.ErrorPrefix) + `-[a-z0-9-]+$`)
 
 	for _, sl := range collectStateLits(pass, pi) {
@@ -472,7 +477,7 @@ func isCatchAllAuth(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, sl *stateLit)
 			if containsNode(x.Body, sl.lit) {
 				if be, ok := x.Cond.(*ast.BinaryExpr); ok && be.Op == token.NEQ && isErrorInterface(pass.TypesInfo.TypeOf(be.X)) {
 					o := ef.classify(sl.fn, be.X, x.Body.Pos(), 0)
-					if o.kind == errRaw && o.callee != nil && strings.Contains(o.callee.Name(), "Connect") {
+					if o.kind == errRaw && strings.Contains(o.calleeFuncName(), "Connect") {
 						return true
 					}
 				}

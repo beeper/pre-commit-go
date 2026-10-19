@@ -69,7 +69,8 @@ A reason is required. An ignore without rule IDs or without a reason is reported
 
 Errors are followed through same-package helpers, so a mapper that returns `WrapErrorInStatus(...)` or a
 `RespError` is recognised automatically. Mappers that sometimes return the error unchanged can be listed
-in `status_mappers`/`login_mappers` in the config.
+in `status_mappers`/`login_mappers` in the config. A function with a deferred closure that maps its named
+error result (`if err != nil { err = wrap(err) }`) is treated as mapped.
 
 ### Configuration
 
@@ -93,14 +94,25 @@ severity:
   GR012: info
 ```
 
-An error counts as a raw network error when it comes from a function that takes a `context.Context`
-in a non-stdlib package (or `net/http`), other than mautrix itself, zerolog, and packages that look like
-a database or ID layer (`*db`, `database`, `store`, `*id`, `*ids`). Set `network_packages` to be
-explicit about the packages.
+An error counts as a raw network error when it comes from:
+
+- `Do`/`RoundTrip` on an HTTP client (net/http or a fork), `http.Get` and friends, a `net.Dial*`, or a
+  read or write on a `Conn`;
+- a function that takes a `context.Context` in a package outside the module, other than the stdlib,
+  mautrix itself, zerolog, and packages that look like a database or ID layer (`*db`, `database`,
+  `store`, `*id`, `*ids`). Set `network_packages` to be explicit about these packages;
+- a function in another package of the module that can reach the network. Packages in the module are
+  analysed from source, so a network library kept in the bridge's repo (`pkg/libgm`, `pkg/signalmeow`)
+  is recognised by what it does, and a context-taking helper that never touches the network (an audio
+  converter, a local store) isn't. Functions that return bridgev2 statuses themselves, like message
+  converters, are followed instead, so the statuses they return count as mapped. Functions that make
+  context-taking calls through interfaces can't be followed and are treated like other libraries.
+  This needs module mode, which is how the hook and `bridgelint ./...` run.
 
 Plain `errors.New`/`fmt.Errorf` errors that don't wrap a network error are treated as internal
 invariants (bad portal IDs, impossible states) and aren't reported, except where the text itself shows
-they're user-facing (MSS002, LP001).
+a permanent rejection (MSS002) or the error is about the login flow ID, which comes from the client
+(LP001).
 
 Rules that depend on newer bridgev2 behaviour check the module's `maunium.net/go/mautrix` version (from
 `go list -m`) and stay quiet when the pinned version doesn't have it.
@@ -115,7 +127,7 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 | Rule | Severity | Flags |
 |---|---|---|
 | MSS001 | error | A handler returns a network error unmapped: as is, or wrapped in `fmt.Errorf`, directly or through a same-package helper. |
-| MSS002 | error | A permanent rejection stays retriable: `ErrorReason` `Unsupported`/`NoPermission`/`TooOld` without `WithStatus(event.MessageStatusFail)`, or a plain error whose text says it's permanent ("not supported", "too large", "only your own", "not allowed"…). Use a `bridgev2.Err*` sentinel where one fits. |
+| MSS002 | error | A permanent rejection stays retriable: `ErrorReason` `Unsupported`/`NoPermission`/`TooOld` without `WithStatus(event.MessageStatusFail)`, or a plain error whose text says it's permanent ("not supported", "too large", "only your own", "not allowed"…). A status with `WithIsCertain(false)` isn't judged by its text. |
 | MSS003 | warning | Raw error text shown to users: `WithErrorAsMessage()` on a library error or on `fmt.Errorf` that formats another error or status code, or `WithMessage(err.Error())`. |
 | MSS004 | warning | `WithIsCertain(true)` on a timeout. |
 | MSS005 | info | A `MessageStatus` literal with a message and certainty but no `ErrorReason` (`WrapErrorInStatus` already defaults it to `GenericError`). |
@@ -151,7 +163,7 @@ phone, for example) asks for retries deliberately and isn't reported.
 
 | Rule | Severity | Flags |
 |---|---|---|
-| LP001 | error | A login or provisioning method returns a network error, or a plain error describing bad input ("required", "invalid", "not found", "at least"…), instead of a `bridgev2.RespError`. |
+| LP001 | error | A login or provisioning method returns a network error, or `CreateLogin` returns a plain error about the flow ID, instead of a `bridgev2.RespError`. Other plain errors aren't reported: their text can't tell bad input from an internal invariant. |
 | LP002 | error | A rate-limit `RespError` (`M_LIMIT_EXCEEDED`, or "rate limit"/"too many requests"/"flood"/"slow down") sent as 429, including `mautrix.MLimitExceeded.WithMessage(...)` without `WithStatus`. Autofix sets 400. |
 | LP003 | error | Any other `RespError` with status 429, 502, 503 or 504. |
 | LP004 | warning | A `RespError` status copied from a network error code (`StatusCode: te.Code`). |
@@ -163,7 +175,7 @@ phone, for example) asks for retries deliberately and isn't reported.
 
 | Rule | Severity | Flags |
 |---|---|---|
-| EP001 | error | Errors matched by exact string: `err.Error() == "..."`, `switch err.Error()`, `strings.EqualFold(err.Error(), ...)`. Substring matches aren't flagged, since some servers only give text. |
+| EP001 | error | Errors matched by exact string: `err.Error() == "..."`, `switch err.Error()`, `strings.EqualFold(err.Error(), ...)`. Comparisons with `""` and substring matches aren't flagged, since some servers only give text. |
 | EP002 | warning | In library packages (ones that don't import bridgev2), an HTTP status formatted into a plain error, so callers can't tell 429 from 403 from 5xx. |
 | EP003 | info | `errors.Join` returned from a Matrix handler or used as a user-facing message. |
 
@@ -174,7 +186,7 @@ phone, for example) asks for retries deliberately and isn't reported.
 | GR001 | warning | An `*http.Response` whose body is never closed and isn't passed on. |
 | GR002 | warning | `http.Get`/`Post`/`Head`, `http.NewRequest` without a context, or `http.DefaultClient`. |
 | GR003 | warning | A request built once with a body and re-sent with `Do` inside a loop; the body is empty on retries. |
-| GR004 | error | `os.Exit`, `log.Fatal*`/`Panic*` or zerolog `Fatal()`/`Panic()` outside `main`, `init` and `Must*` functions. Plain `panic` isn't flagged: panics are alerted on and fixed at the source. |
+| GR004 | error | `os.Exit`, `log.Fatal*` or zerolog `Fatal()` outside `main`, `init` and `Must*` functions. Panics, including `log.Panic*` and zerolog `Panic()`, aren't flagged: they're alerted on and fixed at the source. |
 | GR007 | warning | A blocking channel send in a Matrix handler (no `select` with `default` or `ctx.Done()`). |
 | GR008 | warning | A cursor/seq/checkpoint field assigned after a loop that calls `QueueRemoteEvent`, before the events are handled. |
 | GR009 | warning | A package-level map or slice written at runtime in a bridge package, shared by every login. |

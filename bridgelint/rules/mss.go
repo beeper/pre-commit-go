@@ -15,6 +15,8 @@ var MSSAnalyzer = &analysis.Analyzer{
 	Name: "mss",
 	Doc:  "message status rules (MSS001-MSS006): Matrix handlers must return truthful, human message statuses",
 	Run:  runMSS,
+
+	FactTypes: []analysis.Fact{new(mssErrFact)},
 }
 
 var permanentRegex = regexp.MustCompile(`(?i)not supported|unsupported|(doesn't|does not|don't|do not) support|too (large|long|big)|exceeds the|only (your|their) own|not allowed|(can't|cannot) be (sent|edited|deleted|used)`)
@@ -28,13 +30,16 @@ var permanentReasons = map[string]bool{
 }
 
 func runMSS(pass *analysis.Pass) (any, error) {
+	if len(pass.Files) == 0 {
+		return nil, nil
+	}
 	pi := infoFor(pass)
 	checkIgnores(pass)
+	cfg := ConfigFor(pass)
+	ef := newErrFlow(pi, cfg, cfg.StatusMappers).withFacts(pass, newMSSFact)
 	if !pi.isBridge {
 		return nil, nil
 	}
-	cfg := ConfigFor(pass)
-	ef := newErrFlow(pi, cfg, cfg.StatusMappers)
 	classifiers := findClassifiers(pi, cfg)
 
 	for _, fd := range pi.funcsWithScope(ScopeMatrixHandler) {
@@ -48,10 +53,10 @@ func runMSS(pass *analysis.Pass) (any, error) {
 			switch o.kind {
 			case errConstructed:
 				if o.msg != "" && permanentRegex.MatchString(o.msg) {
-					report(pass, ret, MSS002, fmt.Sprintf("%s returns %s, which reads as permanent but becomes a retriable status; return a bridgev2.Err* sentinel or WrapErrorInStatus(...).WithStatus(event.MessageStatusFail) with an ErrorReason", fd.Name.Name, describeOrigin(pass.Fset, o)))
+					report(pass, ret, MSS002, fmt.Sprintf("%s returns %s, which reads as permanent but becomes a retriable status; return WrapErrorInStatus(...) with an ErrorReason and WithStatus(event.MessageStatusFail)", fd.Name.Name, describeOrigin(pass.Fset, o)))
 					return
 				}
-				if o.callee == nil {
+				if !o.hasCallee() {
 					// A plain error that wraps nothing from the network is usually an internal
 					// invariant; a generic failure status is fine for those.
 					return
@@ -100,8 +105,10 @@ func checkStatusChain(pass *analysis.Pass, ef *errFlow, c *statusChain) {
 		switch {
 		case hasReason && permanentReasons[reason]:
 			report(pass, c.node(), MSS002, fmt.Sprintf("status has ErrorReason %s but no WithStatus(event.MessageStatusFail), so clients offer a retry that can't work", reason))
-		case msg != "" && permanentRegex.MatchString(msg) && !(hasReason && (reason == "MessageStatusNetworkError" || reason == "MessageStatusBridgeUnavailable")):
-			report(pass, c.node(), MSS002, fmt.Sprintf("status %q reads as permanent but stays retriable; add WithStatus(event.MessageStatusFail) and an ErrorReason, or use a bridgev2.Err* sentinel", msg))
+		// WithIsCertain(false) means the message may have been sent, so the author doesn't consider it a
+		// permanent rejection whatever the text says.
+		case msg != "" && permanentRegex.MatchString(msg) && !(hasReason && (reason == "MessageStatusNetworkError" || reason == "MessageStatusBridgeUnavailable")) && !explicitlyUncertain(info, c):
+			report(pass, c.node(), MSS002, fmt.Sprintf("status %q reads as permanent but stays retriable; add WithStatus(event.MessageStatusFail) and an ErrorReason", msg))
 		}
 	}
 
@@ -309,4 +316,9 @@ func hasCtxDoneCase(pi *pkgInfo, cc *ast.CommClause) bool {
 		}
 	}
 	return false
+}
+
+func explicitlyUncertain(info *types.Info, c *statusChain) bool {
+	certain, ok := c.certain(info)
+	return ok && !certain
 }

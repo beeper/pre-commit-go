@@ -76,7 +76,7 @@ var (
 	GR001 = rule("GR001", SeverityWarning, "response body not closed")
 	GR002 = rule("GR002", SeverityWarning, "HTTP request without context or timeout")
 	GR003 = rule("GR003", SeverityWarning, "retry resends a consumed request body")
-	GR004 = rule("GR004", SeverityError, "process exit or panic in connector or library code")
+	GR004 = rule("GR004", SeverityError, "process exit in connector or library code")
 	GR007 = rule("GR007", SeverityWarning, "blocking channel send in a Matrix handler")
 	GR008 = rule("GR008", SeverityWarning, "sync cursor saved before queued events are handled")
 	GR009 = rule("GR009", SeverityWarning, "package-level map or slice written at runtime, shared across logins")

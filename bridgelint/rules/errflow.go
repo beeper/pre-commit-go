@@ -7,6 +7,7 @@ import (
 	"go/types"
 	"strings"
 
+	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/types/typeutil"
 )
 
@@ -28,6 +29,28 @@ type errOrigin struct {
 	helper *ast.FuncDecl
 	// formatsErr is set when a constructed error formats another error or a status code into its text.
 	formatsErr bool
+	// calleePkg and calleeFn name the raw origin when it's only known from another package's summary.
+	calleePkg, calleeFn string
+	// via names the function in another package of the module that the error came through.
+	via string
+}
+
+func (o errOrigin) hasCallee() bool {
+	return o.callee != nil || o.calleeFn != ""
+}
+
+func (o errOrigin) calleePkgName() string {
+	if o.callee != nil && o.callee.Pkg() != nil {
+		return o.callee.Pkg().Name()
+	}
+	return o.calleePkg
+}
+
+func (o errOrigin) calleeFuncName() string {
+	if o.callee != nil {
+		return o.callee.Name()
+	}
+	return o.calleeFn
 }
 
 func (o errOrigin) bad() bool {
@@ -40,10 +63,17 @@ type errFlow struct {
 	cfg      *Config
 	mappers  map[string]bool
 	visiting map[*ast.FuncDecl]bool
+
+	factPass   *analysis.Pass
+	newFact    func() errFact
+	modulePath string
+	network    map[*ast.FuncDecl]bool
+	opaque     map[*ast.FuncDecl]bool
+	deferCache map[ast.Node]bool
 }
 
 func newErrFlow(pi *pkgInfo, cfg *Config, mappers ...[]string) *errFlow {
-	ef := &errFlow{pi: pi, info: pi.pass.TypesInfo, cfg: cfg, mappers: map[string]bool{}, visiting: map[*ast.FuncDecl]bool{}}
+	ef := &errFlow{pi: pi, info: pi.pass.TypesInfo, cfg: cfg, mappers: map[string]bool{}, visiting: map[*ast.FuncDecl]bool{}, deferCache: map[ast.Node]bool{}}
 	for _, list := range mappers {
 		for _, m := range list {
 			ef.mappers[m] = true
@@ -79,7 +109,7 @@ func (ef *errFlow) returnedErrors(fn ast.Node, idx int, cb func(ret *ast.ReturnS
 
 func (ef *errFlow) originOfReturn(fn ast.Node, ret *ast.ReturnStmt, idx, depth int) errOrigin {
 	sig := funcType(ef.info, fn)
-	if sig == nil {
+	if sig == nil || ef.rewrittenByDefer(fn, sig, idx) {
 		return errOrigin{}
 	}
 	switch {
@@ -91,6 +121,83 @@ func (ef *errFlow) originOfReturn(fn ast.Node, ret *ast.ReturnStmt, idx, depth i
 		}
 	}
 	return errOrigin{}
+}
+
+// rewrittenByDefer reports whether fn has a deferred closure that maps every error it returns: it
+// reassigns its named error result from a call that takes the error, at most under an `err != nil` check.
+// The value at each return statement isn't what the caller gets, so it isn't classified. Deferred code
+// that only maps some errors doesn't count.
+func (ef *errFlow) rewrittenByDefer(fn ast.Node, sig *types.Signature, idx int) bool {
+	if idx < 0 || idx >= sig.Results().Len() || sig.Results().At(idx).Name() == "" {
+		return false
+	}
+	if v, ok := ef.deferCache[fn]; ok {
+		return v
+	}
+	result := sig.Results().At(idx)
+	found := false
+	defer func() { ef.deferCache[fn] = found }()
+	refersToResult := func(e ast.Node) bool {
+		refers := false
+		ast.Inspect(e, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && ef.info.Uses[id] == result {
+				refers = true
+			}
+			return !refers
+		})
+		return refers
+	}
+	inspectFunc(funcBody(fn), func(n ast.Node) bool {
+		def, ok := n.(*ast.DeferStmt)
+		if !ok || found {
+			return !found
+		}
+		lit, ok := def.Call.Fun.(*ast.FuncLit)
+		if !ok {
+			return true
+		}
+		ast.Inspect(lit.Body, func(n ast.Node) bool {
+			as, ok := n.(*ast.AssignStmt)
+			if !ok || found || len(as.Lhs) != len(as.Rhs) {
+				return !found
+			}
+			for i, l := range as.Lhs {
+				id, ok := unparen(l).(*ast.Ident)
+				if !ok || ef.info.Uses[id] != result {
+					continue
+				}
+				if _, isCall := unparen(as.Rhs[i]).(*ast.CallExpr); !isCall || !refersToResult(as.Rhs[i]) {
+					continue
+				}
+				if ef.onlyUnderNilCheck(as, lit, result) {
+					found = true
+				}
+			}
+			return !found
+		})
+		return !found
+	})
+	return found
+}
+
+// onlyUnderNilCheck reports whether every if statement between n and lit checks result != nil.
+func (ef *errFlow) onlyUnderNilCheck(n ast.Node, lit *ast.FuncLit, result *types.Var) bool {
+	for p := ef.pi.parents[n]; p != nil && p != lit; p = ef.pi.parents[p] {
+		ifs, ok := p.(*ast.IfStmt)
+		if !ok {
+			continue
+		}
+		be, ok := ifs.Cond.(*ast.BinaryExpr)
+		if !ok || be.Op != token.NEQ {
+			return false
+		}
+		x, ok := unparen(be.X).(*ast.Ident)
+		y, ok2 := unparen(be.Y).(*ast.Ident)
+		if !ok || !ok2 || ef.info.Uses[x] != result || y.Name != "nil" {
+			return false
+		}
+	}
+	return true
 }
 
 func (ef *errFlow) classify(fn ast.Node, e ast.Expr, at token.Pos, depth int) errOrigin {
@@ -252,33 +359,78 @@ func (ef *errFlow) classifyCall(fn ast.Node, call *ast.CallExpr, idx, depth int)
 		return errOrigin{kind: errGood}
 	}
 	if fd := ef.pi.decls[f]; fd != nil {
-		if depth <= 0 || ef.visiting[fd] {
+		return ef.funcOrigin(fd, idx, depth)
+	}
+	if f.Pkg() == nil {
+		return errOrigin{}
+	}
+	if ef.inModule(f.Pkg().Path()) {
+		if idx != sig.Results().Len()-1 {
 			return errOrigin{}
 		}
-		ef.visiting[fd] = true
-		defer delete(ef.visiting, fd)
-		var worst errOrigin
-		inspectFunc(fd.Body, func(n ast.Node) bool {
-			ret, ok := n.(*ast.ReturnStmt)
-			if !ok {
-				return true
-			}
-			o := ef.originOfReturn(fd, ret, idx, depth-1)
-			if o.bad() && (!worst.bad() || o.kind == errRaw && worst.kind != errRaw) {
-				worst = o
-				if worst.helper == nil {
-					worst.helper = fd
-				}
-			}
-			return true
-		})
-		return worst
+		return ef.importedOrigin(f, call)
+	}
+	if isHTTPRoundTrip(f) {
+		return errOrigin{kind: errRaw, node: call, callee: f}
 	}
 	// Network calls take a context; parsers and converters that don't are treated as internal.
-	if f.Pkg() != nil && isNetworkPackage(ef.cfg, ef.pi.pass.Pkg, f.Pkg().Path()) && takesContext(sig) {
+	// net/http's only context-taking function builds a request, which doesn't touch the network.
+	if f.Pkg().Path() != "net/http" && isNetworkPackage(ef.cfg, ef.pi.pass.Pkg, f.Pkg().Path()) && takesContext(sig) {
 		return errOrigin{kind: errRaw, node: call, callee: f}
 	}
 	return errOrigin{}
+}
+
+// funcOrigin returns the worst error that fd, a function in this package, can return as result idx.
+func (ef *errFlow) funcOrigin(fd *ast.FuncDecl, idx, depth int) errOrigin {
+	if depth <= 0 || ef.visiting[fd] {
+		return errOrigin{}
+	}
+	ef.visiting[fd] = true
+	defer delete(ef.visiting, fd)
+	var worst errOrigin
+	inspectFunc(fd.Body, func(n ast.Node) bool {
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok {
+			return true
+		}
+		o := ef.originOfReturn(fd, ret, idx, depth-1)
+		if o.bad() && (!worst.bad() || o.kind == errRaw && worst.kind != errRaw) {
+			worst = o
+			if worst.helper == nil && worst.via == "" {
+				worst.helper = fd
+			}
+		}
+		return true
+	})
+	return worst
+}
+
+// isHTTPRoundTrip matches calls that send an HTTP request: net/http's helpers, and Do/RoundTrip methods
+// taking a *Request on any client (fhttp and other net/http forks). The context comes from the request,
+// so they don't take one themselves.
+func isHTTPRoundTrip(f *types.Func) bool {
+	if f.Pkg() == nil {
+		return false
+	}
+	sig, ok := f.Type().(*types.Signature)
+	if !ok {
+		return false
+	}
+	if sig.Recv() == nil {
+		return f.Pkg().Path() == "net/http" && (f.Name() == "Get" || f.Name() == "Head" || f.Name() == "Post" || f.Name() == "PostForm")
+	}
+	if f.Name() != "Do" && f.Name() != "RoundTrip" {
+		return false
+	}
+	for i := 0; i < sig.Params().Len(); i++ {
+		if ptr, ok := sig.Params().At(i).Type().(*types.Pointer); ok {
+			if named, ok := ptr.Elem().(*types.Named); ok && named.Obj().Name() == "Request" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (ef *errFlow) classifyErrorf(fn ast.Node, call *ast.CallExpr, depth int) errOrigin {
@@ -310,7 +462,7 @@ func (ef *errFlow) classifyErrorf(fn ast.Node, call *ast.CallExpr, depth int) er
 			return errOrigin{kind: inner.kind, formatsErr: o.formatsErr}
 		}
 		if inner.kind == errRaw {
-			o.callee = inner.callee
+			o.callee, o.calleePkg, o.calleeFn, o.via = inner.callee, inner.calleePkg, inner.calleeFn, inner.via
 		}
 	}
 	return o
@@ -375,12 +527,12 @@ func describeOrigin(fset *token.FileSet, o errOrigin) string {
 		} else {
 			s = "plain error"
 		}
-		if o.callee != nil {
-			s += fmt.Sprintf(" wrapping a raw %s error", o.callee.Pkg().Name())
+		if o.hasCallee() {
+			s += fmt.Sprintf(" wrapping a raw %s error", o.calleePkgName())
 		}
 	case errRaw:
-		if o.callee != nil {
-			s = fmt.Sprintf("raw error from %s.%s", o.callee.Pkg().Name(), o.callee.Name())
+		if o.hasCallee() {
+			s = fmt.Sprintf("raw error from %s.%s", o.calleePkgName(), o.calleeFuncName())
 		} else {
 			s = "raw library error"
 		}
@@ -389,6 +541,8 @@ func describeOrigin(fset *token.FileSet, o errOrigin) string {
 	}
 	if o.helper != nil {
 		s += fmt.Sprintf(" (via %s at %s)", o.helper.Name.Name, shortPos(fset, o.node))
+	} else if o.via != "" {
+		s += fmt.Sprintf(" (via %s at %s)", o.via, shortPos(fset, o.node))
 	}
 	return s
 }

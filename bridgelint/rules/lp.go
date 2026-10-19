@@ -16,13 +16,17 @@ var LPAnalyzer = &analysis.Analyzer{
 	Name: "lp",
 	Doc:  "login and provisioning rules (LP001-LP008): failures must be RespErrors with HTTP statuses that clients won't retry automatically",
 	Run:  runLP,
+
+	FactTypes: []analysis.Fact{new(lpErrFact)},
 }
 
 var (
-	rateLimitRegex = regexp.MustCompile(`(?i)rate.?limit|too many requests|flood|slow ?down`)
+	rateLimitRegex = regexp.MustCompile(`(?i)rate.?limit|too many (requests|attempts|tries)|flood|slow ?down`)
 	// userInputRegex matches plain login/provisioning errors that describe bad user input, which should be 4xx.
 	// Other plain errors are treated as internal invariants and not reported.
-	userInputRegex = regexp.MustCompile(`(?i)\b(required|empty|missing|invalid|not found|no \w+( \w+)? (found|matched)|multiple \w+( \w+)? matched|must|too (few|many|long|short)|at least|unknown (login )?flow)\b`)
+	// flowRegex matches CreateLogin errors about the flow ID, which comes straight from the client.
+	// Other plain errors can't be told apart from internal invariants by their text, so they aren't reported.
+	flowRegex = regexp.MustCompile(`(?i)\bflow\b`)
 )
 
 // autoRetriedStatuses are the HTTP statuses that clients (mautrix-go's retryafter.Should, and the Beeper
@@ -82,12 +86,15 @@ type respErr struct {
 }
 
 func runLP(pass *analysis.Pass) (any, error) {
+	if len(pass.Files) == 0 {
+		return nil, nil
+	}
 	pi := infoFor(pass)
+	cfg := ConfigFor(pass)
+	ef := newErrFlow(pi, cfg, cfg.LoginMappers).withFacts(pass, newLPFact)
 	if !pi.isBridge {
 		return nil, nil
 	}
-	cfg := ConfigFor(pass)
-	ef := newErrFlow(pi, cfg, cfg.LoginMappers)
 	info := pass.TypesInfo
 
 	for _, fd := range pi.funcsWithScope(ScopeLogin | ScopeProvisioning) {
@@ -96,7 +103,7 @@ func runLP(pass *analysis.Pass) (any, error) {
 			continue
 		}
 		ef.returnedErrors(fd, idx, func(ret *ast.ReturnStmt, o errOrigin) {
-			if o.kind == errRaw || o.kind == errConstructed && (o.callee != nil || userInputRegex.MatchString(o.msg)) {
+			if o.kind == errRaw || o.kind == errConstructed && (o.hasCallee() || isUnknownFlowError(pi, fd, o)) {
 				report(pass, ret, LP001, fmt.Sprintf("%s returns %s, which reaches clients as a bare 500 M_UNKNOWN; return a bridgev2.RespError with a matching status (or wrap with bridgev2.WrapRespErr)", fd.Name.Name, describeOrigin(pass.Fset, o)))
 			}
 		})
@@ -364,6 +371,10 @@ func checkDefaultLimitExceeded(pass *analysis.Pass, pi *pkgInfo, file *ast.File,
 	}
 	report(pass, outer, LP002, "mautrix.MLimitExceeded is sent as HTTP 429 by default, which clients retry automatically; add WithStatus(400)",
 		withFix("Use 400", analysis.TextEdit{Pos: outer.End(), End: outer.End(), NewText: []byte(".WithStatus(" + statusBadRequest(file) + ")")}))
+}
+
+func isUnknownFlowError(pi *pkgInfo, fd *ast.FuncDecl, o errOrigin) bool {
+	return fd.Name.Name == "CreateLogin" && pi.scopes[fd]&ScopeLogin != 0 && flowRegex.MatchString(o.msg)
 }
 
 // checkDuplicateValidation implements LP008.
