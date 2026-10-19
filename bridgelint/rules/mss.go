@@ -125,7 +125,14 @@ func checkStatusChain(pass *analysis.Pass, ef *errFlow, c *statusChain) {
 		report(pass, c.node(), MSS004, "WithIsCertain(true) on a timeout; the message may have been sent, so certainty should be false")
 	}
 
-	// MSS005
+	// MSS005: WrapErrorInStatus defaults ErrorReason to GenericError, so only literals can leave it empty.
+	if _, isLit := c.root.(*ast.CompositeLit); isLit {
+		checkMissingReason(pass, c)
+	}
+}
+
+func checkMissingReason(pass *analysis.Pass, c *statusChain) {
+	info := pass.TypesInfo
 	if _, hasMsg := c.message(); hasMsg {
 		if _, hasCertain := c.certain(info); hasCertain || c.has("WithIsCertain") {
 			if _, hasReason := c.reason(info); !hasReason {

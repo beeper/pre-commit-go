@@ -118,7 +118,7 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 | MSS002 | error | A permanent rejection stays retriable: `ErrorReason` `Unsupported`/`NoPermission`/`TooOld` without `WithStatus(event.MessageStatusFail)`, or a plain error whose text says it's permanent ("not supported", "too large", "only your own", "not allowed"…). Use a `bridgev2.Err*` sentinel where one fits. |
 | MSS003 | warning | Raw error text shown to users: `WithErrorAsMessage()` on a library error or on `fmt.Errorf` that formats another error or status code, or `WithMessage(err.Error())`. |
 | MSS004 | warning | `WithIsCertain(true)` on a timeout. |
-| MSS005 | info | A status with a message and certainty but no `ErrorReason`. |
+| MSS005 | info | A `MessageStatus` literal with a message and certainty but no `ErrorReason` (`WrapErrorInStatus` already defaults it to `GenericError`). |
 | MSS006 | warning | The package has a typed error classifier (a `func(error) string/int` named like `*Code`/`*Kind`/`*Status` that calls `errors.As`, or one listed in `classifiers`) but a handler returns network errors without using it. |
 
 ### Bridge states (BS)

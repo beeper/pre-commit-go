@@ -101,7 +101,8 @@ func statuses(err error) []error {
 		bridgev2.WrapErrorInStatus(fmt.Errorf("server said %w", err)).WithErrorAsMessage().WithErrorReason(event.MessageStatusNetworkError), // want `MSS003: WithErrorAsMessage shows an error that formats another error`
 		bridgev2.WrapErrorInStatus(err).WithMessage("failed: " + err.Error()).WithErrorReason(event.MessageStatusNetworkError),              // want `MSS003: status message is built from raw error text`
 		bridgev2.WrapErrorInStatus(context.DeadlineExceeded).WithIsCertain(true).WithErrorReason(event.MessageStatusNetworkError),           // want `MSS004: WithIsCertain\(true\) on a timeout`
-		bridgev2.WrapErrorInStatus(err).WithMessage("network is down").WithIsCertain(false),                                                 // want `MSS005: status sets a message and certainty but no ErrorReason`
+		bridgev2.WrapErrorInStatus(err).WithMessage("network is down").WithIsCertain(false),
+		bridgev2.MessageStatus{Message: "network is down", IsCertain: true}, // want `MSS005: status sets a message and certainty but no ErrorReason`
 		bridgev2.WrapErrorInStatus(errors.New("that emoji can't be used")).WithErrorAsMessage().WithStatus(event.MessageStatusFail).WithErrorReason(event.MessageStatusUnsupported),
 	}
 }
