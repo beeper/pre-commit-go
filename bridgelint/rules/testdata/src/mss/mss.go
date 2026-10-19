@@ -63,7 +63,8 @@ func (c *Client) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit)
 func (c *Client) sendHelper(ctx context.Context) error {
 	_, err := c.client.Send(ctx, "x")
 	if err != nil {
-		return fmt.Errorf("failed to send: %w", err)
+		err = fmt.Errorf("failed to send: %w", err)
+		return err
 	}
 	return nil
 }

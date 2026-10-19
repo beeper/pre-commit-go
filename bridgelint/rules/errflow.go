@@ -292,11 +292,20 @@ func (ef *errFlow) classifyErrorf(fn ast.Node, call *ast.CallExpr, depth int) er
 	if !ok {
 		return o
 	}
+	// Arguments are evaluated before the enclosing statement assigns anything, so look up locals from the
+	// statement's position. Otherwise `err = fmt.Errorf("...: %w", err)` resolves err to itself forever.
+	at := call.Pos()
+	for p := ef.pi.parents[call]; p != nil; p = ef.pi.parents[p] {
+		if _, ok := p.(ast.Stmt); ok {
+			at = p.Pos()
+			break
+		}
+	}
 	for _, argIdx := range wrapVerbArgs(format) {
 		if argIdx+1 >= len(call.Args) {
 			continue
 		}
-		inner := ef.classify(fn, call.Args[argIdx+1], call.Pos(), depth)
+		inner := ef.classify(fn, call.Args[argIdx+1], at, depth)
 		if !inner.bad() {
 			return errOrigin{kind: inner.kind, formatsErr: o.formatsErr}
 		}
