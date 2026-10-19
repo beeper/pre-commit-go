@@ -8,22 +8,27 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"unicode"
 
 	"golang.org/x/tools/go/analysis"
 )
 
-// ModuleHumanErrorKeys holds human-error codes registered anywhere in the packages being linted.
-// The driver fills it before analysis so a code registered in one package counts in another.
-var ModuleHumanErrorKeys = map[string]bool{}
+// humanKeysFact records the status.BridgeStateHumanErrors codes a package registers, so a code
+// registered in one package counts in the packages that import it.
+type humanKeysFact struct{ Keys []string }
+
+func (*humanKeysFact) AFact() {}
+
+func (f *humanKeysFact) String() string { return fmt.Sprintf("humanKeys%v", f.Keys) }
 
 var BSAnalyzer = &analysis.Analyzer{
 	Name: "bs",
 	Doc:  "bridge state rules (BS001-BS011): states must carry the right event, action, code and human message, and failures must not be silent",
 	Run:  runBS,
 
-	FactTypes: []analysis.Fact{new(bsErrFact)},
+	FactTypes: []analysis.Fact{new(bsErrFact), new(humanKeysFact)},
 }
 
 var (
@@ -49,8 +54,20 @@ func runBS(pass *analysis.Pass) (any, error) {
 	}
 	pi := infoFor(pass)
 	keys := CollectHumanErrorKeys(pass.TypesInfo, pass.Files)
-	for k := range ModuleHumanErrorKeys {
-		keys[k] = true
+	if len(keys) > 0 {
+		own := make([]string, 0, len(keys))
+		for k := range keys {
+			own = append(own, k)
+		}
+		sort.Strings(own)
+		pass.ExportPackageFact(&humanKeysFact{Keys: own})
+	}
+	for _, pf := range pass.AllPackageFacts() {
+		if hk, ok := pf.Fact.(*humanKeysFact); ok {
+			for _, k := range hk.Keys {
+				keys[k] = true
+			}
+		}
 	}
 	cfg := ConfigFor(pass)
 	ef := newErrFlow(pi, cfg).withFacts(pass, newBSFact)

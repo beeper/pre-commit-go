@@ -1,23 +1,29 @@
 // Command bridgelint checks mautrix bridgev2 bridges for the error-reporting and reliability
 // mistakes found in Beeper's bridge audits. See README.md for the rules.
+//
+// It runs as a go vet tool: `bridgelint ./...` invokes `go vet -vettool=<itself> -json`, which analyses
+// one package per process in dependency order and passes facts between them through files, then
+// filters and prints the results. The go build cache keeps each package's results between runs.
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"go/token"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
-	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/checker"
-	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/go/analysis/unitchecker"
 
 	"github.com/beeper/pre-commit-go/bridgelint/rules"
 )
@@ -30,16 +36,41 @@ const (
 	colorReset  = "\033[0m"
 )
 
-var (
-	verbose       = flag.Bool("verbose", false, "also show info-level findings")
-	configPath    = flag.String("config", "", "path to .bridgelint.yaml (default: nearest one above each package)")
-	baselinePath  = flag.String("baseline", "", "ignore findings recorded in this baseline file")
-	writeBaseline = flag.Bool("write-baseline", false, "write all current findings to the -baseline file and exit 0")
-	applyFixes    = flag.Bool("fix", false, "apply suggested fixes for reported findings")
-	includeTests  = flag.Bool("tests", false, "also analyse _test.go files")
-	noColor       = flag.Bool("no-color", os.Getenv("NO_COLOR") != "", "disable colored output")
-	listRules     = flag.Bool("rules", false, "list rules and exit")
+const (
+	envConfig         = "BRIDGELINT_CONFIG"
+	envMautrixVersion = "BRIDGELINT_MAUTRIX_VERSION"
 )
+
+var (
+	outerFlags    = flag.NewFlagSet("bridgelint", flag.ExitOnError)
+	verbose       = outerFlags.Bool("verbose", false, "also show info-level findings")
+	configPath    = outerFlags.String("config", "", "path to .bridgelint.yaml (default: nearest one above each package)")
+	baselinePath  = outerFlags.String("baseline", "", "ignore findings recorded in this baseline file")
+	writeBaseline = outerFlags.Bool("write-baseline", false, "write all current findings to the -baseline file and exit 0")
+	applyFixes    = outerFlags.Bool("fix", false, "apply suggested fixes for reported findings")
+	includeTests  = outerFlags.Bool("tests", false, "also report findings in _test.go files")
+	noColor       = outerFlags.Bool("no-color", os.Getenv("NO_COLOR") != "", "disable colored output")
+	listRules     = outerFlags.Bool("rules", false, "list rules and exit")
+)
+
+type textEdit struct {
+	Filename string `json:"filename"`
+	Start    int    `json:"start"`
+	End      int    `json:"end"`
+	New      string `json:"new"`
+}
+
+type suggestedFix struct {
+	Message string     `json:"message"`
+	Edits   []textEdit `json:"edits"`
+}
+
+type jsonDiagnostic struct {
+	Category       string         `json:"category"`
+	Posn           string         `json:"posn"`
+	Message        string         `json:"message"`
+	SuggestedFixes []suggestedFix `json:"suggested_fixes"`
+}
 
 type finding struct {
 	rule     string
@@ -47,27 +78,39 @@ type finding struct {
 	pos      token.Position
 	message  string
 	snippet  string
-	diag     analysis.Diagnostic
-	fset     *token.FileSet
+	fixes    []suggestedFix
 }
 
 func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: bridgelint [flags] [packages]\n\nPackages default to ./...\n\n")
-		flag.PrintDefaults()
+	if isVetTool(os.Args[1:]) {
+		rules.ConfigOverride = os.Getenv(envConfig)
+		rules.MautrixVersion = os.Getenv(envMautrixVersion)
+		unitchecker.Main(rules.Analyzers...)
+		return
 	}
-	flag.Parse()
+	outerFlags.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: bridgelint [flags] [packages]\n\nPackages default to ./...\n\n")
+		outerFlags.PrintDefaults()
+	}
+	_ = outerFlags.Parse(os.Args[1:])
 	if *listRules {
 		printRules()
 		return
 	}
-	rules.ConfigOverride = *configPath
-	rules.MautrixVersion = mautrixVersion()
-	patterns := flag.Args()
+	patterns := outerFlags.Args()
 	if len(patterns) == 0 {
 		patterns = []string{"./..."}
 	}
 	os.Exit(run(patterns))
+}
+
+// isVetTool reports whether the go command is running us as a vet tool: it asks for the version and
+// flags, then passes a single .cfg file per package.
+func isVetTool(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	return args[0] == "-V=full" || args[0] == "-flags" || strings.HasSuffix(args[len(args)-1], ".cfg")
 }
 
 // mautrixVersion asks the go command which mautrix the current module builds against.
@@ -99,59 +142,34 @@ func printRules() {
 }
 
 func run(patterns []string) int {
-	cfg := &packages.Config{Mode: packages.LoadSyntax | packages.NeedModule, Tests: *includeTests}
-	pkgs, err := packages.Load(cfg, patterns...)
+	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bridgelint: %v\n", err)
 		return 2
 	}
-	if n := packages.PrintErrors(pkgs); n > 0 {
-		fmt.Fprintf(os.Stderr, "bridgelint: %d package loading errors\n", n)
-		return 2
-	}
-	for _, pkg := range pkgs {
-		for k := range rules.CollectHumanErrorKeys(pkg.TypesInfo, pkg.Syntax) {
-			rules.ModuleHumanErrorKeys[k] = true
+	configAbs := *configPath
+	if configAbs != "" {
+		if configAbs, err = filepath.Abs(configAbs); err != nil {
+			fmt.Fprintf(os.Stderr, "bridgelint: %v\n", err)
+			return 2
 		}
 	}
-	graph, err := checker.Analyze(rules.Analyzers, pkgs, &checker.Options{})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "bridgelint: %v\n", err)
-		return 2
-	}
-
-	cwd, _ := os.Getwd()
-	seen := map[string]bool{}
-	var findings []finding
-	failed := false
-	for act := range graph.All() {
-		if !act.IsRoot {
-			continue
+	cmd := exec.Command("go", append([]string{"vet", "-vettool=" + exe, "-json"}, patterns...)...)
+	cmd.Env = append(os.Environ(), envConfig+"="+configAbs, envMautrixVersion+"="+mautrixVersion())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	runErr := cmd.Run()
+	findings, analysisErrs, err := parseVetJSON(&stdout)
+	if err != nil || runErr != nil || len(analysisErrs) > 0 {
+		os.Stderr.Write(stderr.Bytes())
+		for _, e := range analysisErrs {
+			fmt.Fprintf(os.Stderr, "bridgelint: %s\n", e)
 		}
-		if act.Err != nil {
-			fmt.Fprintf(os.Stderr, "bridgelint: %s: %v\n", act, act.Err)
-			failed = true
-			continue
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bridgelint: reading go vet output: %v\n", err)
+		} else if runErr != nil {
+			fmt.Fprintf(os.Stderr, "bridgelint: go vet: %v\n", runErr)
 		}
-		fset := act.Package.Fset
-		for _, d := range act.Diagnostics {
-			id, sev := rules.SplitCategory(d.Category)
-			pos := fset.Position(d.Pos)
-			if rel, err := filepath.Rel(cwd, pos.Filename); err == nil && !strings.HasPrefix(rel, "..") {
-				pos.Filename = rel
-			}
-			key := fmt.Sprintf("%s:%d:%d:%s", pos.Filename, pos.Line, pos.Column, d.Message)
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			findings = append(findings, finding{
-				rule: id, severity: sev, pos: pos, message: d.Message,
-				snippet: lineText(fset.Position(d.Pos)), diag: d, fset: fset,
-			})
-		}
-	}
-	if failed {
 		return 2
 	}
 	sort.Slice(findings, func(i, j int) bool {
@@ -212,6 +230,74 @@ func run(patterns []string) int {
 		return 1
 	}
 	return 0
+}
+
+// parseVetJSON reads go vet's -json output: a stream of objects mapping package ID to analyzer name to
+// either a list of diagnostics or {"error": ...}. Test variants of a package report the same findings
+// for its non-test files, so findings are deduplicated by position and message.
+func parseVetJSON(r io.Reader) ([]finding, []string, error) {
+	cwd, _ := os.Getwd()
+	seen := map[string]bool{}
+	var findings []finding
+	var errs []string
+	dec := json.NewDecoder(r)
+	for {
+		var tree map[string]map[string]json.RawMessage
+		if err := dec.Decode(&tree); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return nil, nil, err
+		}
+		for pkg, analyzers := range tree {
+			for name, raw := range analyzers {
+				var diags []jsonDiagnostic
+				if err := json.Unmarshal(raw, &diags); err != nil {
+					var e struct {
+						Error string `json:"error"`
+					}
+					if json.Unmarshal(raw, &e) == nil && e.Error != "" {
+						errs = append(errs, fmt.Sprintf("%s: %s: %s", pkg, name, e.Error))
+						continue
+					}
+					return nil, nil, err
+				}
+				for _, d := range diags {
+					pos := parsePosn(d.Posn)
+					if !*includeTests && strings.HasSuffix(pos.Filename, "_test.go") {
+						continue
+					}
+					key := fmt.Sprintf("%s:%d:%d:%s", pos.Filename, pos.Line, pos.Column, d.Message)
+					if seen[key] {
+						continue
+					}
+					seen[key] = true
+					snippet := lineText(pos)
+					if rel, err := filepath.Rel(cwd, pos.Filename); err == nil && !strings.HasPrefix(rel, "..") {
+						pos.Filename = rel
+					}
+					id, sev := rules.SplitCategory(d.Category)
+					findings = append(findings, finding{rule: id, severity: sev, pos: pos, message: d.Message, snippet: snippet, fixes: d.SuggestedFixes})
+				}
+			}
+		}
+	}
+	return findings, errs, nil
+}
+
+// parsePosn parses "file:line:col".
+func parsePosn(s string) token.Position {
+	var pos token.Position
+	rest := s
+	if i := strings.LastIndexByte(rest, ':'); i >= 0 {
+		pos.Column, _ = strconv.Atoi(rest[i+1:])
+		rest = rest[:i]
+	}
+	if i := strings.LastIndexByte(rest, ':'); i >= 0 {
+		pos.Line, _ = strconv.Atoi(rest[i+1:])
+		rest = rest[:i]
+	}
+	pos.Filename = rest
+	return pos
 }
 
 func color(c, s string) string {
@@ -315,24 +401,38 @@ func filterBaseline(path string, findings []finding) ([]finding, error) {
 	return out, nil
 }
 
-type edit struct {
-	start, end int
-	text       []byte
-}
-
+// fix applies the first suggested fix of each finding. A fix is applied whole or not at all: if any of
+// its edits overlaps an edit already applied, it's skipped.
 func fix(findings []finding) error {
-	byFile := map[string][]edit{}
+	type span struct{ start, end int }
+	byFile := map[string][]textEdit{}
+	taken := map[string][]span{}
+	overlaps := func(e textEdit) bool {
+		for _, s := range taken[e.Filename] {
+			if e.Start < s.end && s.start < e.End || e.Start == s.start {
+				return true
+			}
+		}
+		return false
+	}
 	for _, f := range findings {
-		if len(f.diag.SuggestedFixes) == 0 {
+		if len(f.fixes) == 0 {
 			continue
 		}
-		for _, te := range f.diag.SuggestedFixes[0].TextEdits {
-			start := f.fset.Position(te.Pos)
-			end := start
-			if te.End.IsValid() {
-				end = f.fset.Position(te.End)
+		edits := f.fixes[0].Edits
+		ok := true
+		for _, e := range edits {
+			if overlaps(e) {
+				ok = false
+				break
 			}
-			byFile[start.Filename] = append(byFile[start.Filename], edit{start.Offset, end.Offset, te.NewText})
+		}
+		if !ok {
+			continue
+		}
+		for _, e := range edits {
+			taken[e.Filename] = append(taken[e.Filename], span{e.Start, e.End})
+			byFile[e.Filename] = append(byFile[e.Filename], e)
 		}
 	}
 	for name, edits := range byFile {
@@ -340,21 +440,14 @@ func fix(findings []finding) error {
 		if err != nil {
 			return err
 		}
-		sort.Slice(edits, func(i, j int) bool { return edits[i].start > edits[j].start })
-		lastStart := len(data) + 1
-		applied := 0
+		sort.Slice(edits, func(i, j int) bool { return edits[i].Start > edits[j].Start })
 		for _, e := range edits {
-			if e.end > lastStart {
-				continue // overlaps an edit already applied
-			}
-			data = append(data[:e.start:e.start], append(append([]byte{}, e.text...), data[e.end:]...)...)
-			lastStart = e.start
-			applied++
+			data = append(data[:e.Start:e.Start], append([]byte(e.New), data[e.End:]...)...)
 		}
 		if err := os.WriteFile(name, data, 0o644); err != nil {
 			return err
 		}
-		fmt.Printf("bridgelint: applied %d fixes to %s\n", applied, name)
+		fmt.Printf("bridgelint: applied %d edits to %s\n", len(edits), name)
 	}
 	return nil
 }

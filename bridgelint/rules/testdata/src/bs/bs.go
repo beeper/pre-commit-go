@@ -1,4 +1,4 @@
-package bs
+package bs // want package:"humanKeys\\[ex-invalid-auth\\]"
 
 import (
 	"context"

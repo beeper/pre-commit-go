@@ -36,6 +36,10 @@ As a pre-commit hook:
 The hook runs on the whole module (`./...`) whenever a Go file changes, because the rules need type
 information from every package.
 
+`bridgelint` runs itself as a `go vet` tool (`go vet -vettool=bridgelint -json`), so each package is
+analysed in its own process, in dependency order, with what's learned about its functions passed to
+importers through the build cache. Packages that haven't changed aren't analysed again.
+
 ### Severity
 
 - `error` findings fail the run.
