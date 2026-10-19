@@ -3,6 +3,7 @@ package rules
 import (
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/types"
 	"regexp"
 	"strconv"
@@ -13,7 +14,7 @@ import (
 
 var LPAnalyzer = &analysis.Analyzer{
 	Name: "lp",
-	Doc:  "login and provisioning rules (LP001-LP008): user-caused failures must be RespErrors with matching HTTP statuses",
+	Doc:  "login and provisioning rules (LP001-LP008): failures must be RespErrors with HTTP statuses that clients won't retry automatically",
 	Run:  runLP,
 }
 
@@ -21,9 +22,16 @@ var (
 	rateLimitRegex = regexp.MustCompile(`(?i)rate.?limit|too many requests|flood|slow ?down`)
 	// userInputRegex matches plain login/provisioning errors that describe bad user input, which should be 4xx.
 	// Other plain errors are treated as internal invariants and not reported.
-	userInputRegex     = regexp.MustCompile(`(?i)\b(required|empty|missing|invalid|not found|no \w+( \w+)? (found|matched)|multiple \w+( \w+)? matched|must|too (few|many|long|short)|at least|unknown (login )?flow)\b`)
-	temporaryRegex     = regexp.MustCompile(`(?i)temporar|unavailable|outage|try again later`)
-	temporaryCodeRegex = regexp.MustCompile(`(?i)temporar|outage`)
+	userInputRegex = regexp.MustCompile(`(?i)\b(required|empty|missing|invalid|not found|no \w+( \w+)? (found|matched)|multiple \w+( \w+)? matched|must|too (few|many|long|short)|at least|unknown (login )?flow)\b`)
+)
+
+// autoRetriedStatuses are the HTTP statuses that clients (mautrix-go's retryafter.Should, and the Beeper
+// clients) retry automatically. Login and provisioning requests must not be retried behind the user's back.
+var autoRetriedStatuses = map[int64]bool{429: true, 502: true, 503: true, 504: true}
+
+const (
+	lp002Msg = "rate limit RespError is sent as HTTP 429, which clients retry automatically; use 400 (the M_LIMIT_EXCEEDED code still says it's a rate limit)"
+	lp003Fmt = "RespError is sent as HTTP %d, which clients retry automatically; use 500 for upstream failures or a 4xx for rejections"
 )
 
 // standardCodes maps standard Matrix error codes to their mautrix.RespError variables and default statuses.
@@ -111,7 +119,9 @@ func runLP(pass *analysis.Pass) (any, error) {
 					checkRespErrLit(pass, pi, f, x)
 				}
 			case *ast.CallExpr:
-				checkRespErrCall(pass, x)
+				checkRespErrCall(pass, pi, f, x)
+			case *ast.SelectorExpr:
+				checkDefaultLimitExceeded(pass, pi, f, x)
 			}
 			return true
 		})
@@ -172,27 +182,22 @@ func checkRespErrLit(pass *analysis.Pass, pi *pkgInfo, file *ast.File, lit *ast.
 	re := parseRespErrLit(info, lit)
 	isRate := re.code == "M_LIMIT_EXCEEDED" || rateLimitRegex.MatchString(re.msg) || rateLimitRegex.MatchString(re.code)
 
-	// LP002
-	lp002 := isRate && re.status != nil && re.statusKnow && re.statusVal != 429
-	if lp002 {
-		report(pass, re.status, LP002, fmt.Sprintf("rate limit returned as HTTP %d; use 429", re.statusVal), withFix("Use 429", analysis.TextEdit{Pos: re.status.Pos(), End: re.status.End(), NewText: []byte(statusTooManyRequests(file))}))
-	} else if isRate && re.status == nil && !parentCallsWithStatus(pi, lit) {
-		report(pass, lit, LP002, "rate limit RespError has no StatusCode, so it's sent as 500; use 429")
-	}
-
-	// LP003
-	isRestriction := restrictionRegex.MatchString(re.msg) || restrictionRegex.MatchString(re.code)
-	if !lp002 && !isRestriction && re.statusKnow && re.statusVal >= 400 && re.statusVal < 500 && re.statusVal != 429 && (temporaryRegex.MatchString(re.msg) || temporaryCodeRegex.MatchString(re.code)) {
-		report(pass, re.status, LP003, fmt.Sprintf("temporary or upstream failure returned as HTTP %d; use 502 or 503", re.statusVal))
+	// LP002, LP003
+	if re.statusKnow && autoRetriedStatuses[re.statusVal] && !isTrue(info, re.fields["CanRetry"]) && !explicitlyRetriable(pi, info, lit) {
+		if isRate && re.statusVal == 429 {
+			report(pass, re.status, LP002, lp002Msg, withFix("Use 400", analysis.TextEdit{Pos: re.status.Pos(), End: re.status.End(), NewText: []byte(statusBadRequest(file))}))
+		} else {
+			report(pass, re.status, LP003, fmt.Sprintf(lp003Fmt, re.statusVal))
+		}
 	}
 
 	// LP004
 	if re.status != nil && !re.statusKnow && isPassthroughStatus(info, re.status) {
-		report(pass, re.status, LP004, "HTTP status copied from a network error code; map it to a fixed status (429 for rate limits, 401/403 for auth, 502/503 for upstream)")
+		report(pass, re.status, LP004, "HTTP status copied from a network error code; map it to a fixed status (400 with M_LIMIT_EXCEEDED for rate limits, 401/403 for auth, 500 for upstream)")
 	}
 
 	// LP005
-	if re.status == nil && !isRate && !parentCallsWithStatus(pi, lit) && pass.Pkg.Path() != pathMautrix {
+	if re.status == nil && !parentCallsWithStatus(pi, lit) && pass.Pkg.Path() != pathMautrix {
 		report(pass, lit, LP005, "RespError literal without StatusCode is sent as 500; set the status that matches the cause")
 	}
 
@@ -212,16 +217,11 @@ func parentCallsWithStatus(pi *pkgInfo, lit *ast.CompositeLit) bool {
 	return ok && sel.Sel.Name == "WithStatus"
 }
 
-func statusTooManyRequests(file *ast.File) string {
-	for _, imp := range file.Imports {
-		if imp.Path.Value == `"net/http"` {
-			if imp.Name != nil {
-				return imp.Name.Name + ".StatusTooManyRequests"
-			}
-			return "http.StatusTooManyRequests"
-		}
+func statusBadRequest(file *ast.File) string {
+	if name, ok := importName(file, "net/http"); ok {
+		return name + ".StatusBadRequest"
 	}
-	return "429"
+	return "400"
 }
 
 func importName(file *ast.File, path string) (string, bool) {
@@ -282,14 +282,14 @@ func isPassthroughStatus(info *types.Info, e ast.Expr) bool {
 	return strings.Contains(name, "code") || strings.Contains(name, "status")
 }
 
-// checkRespErrCall handles mautrix.MX.WithStatus(...) chains and WrapRespErrManual (LP002, LP004).
-func checkRespErrCall(pass *analysis.Pass, call *ast.CallExpr) {
+// checkRespErrCall handles mautrix.MX.WithStatus(...) chains and WrapRespErrManual (LP002, LP003, LP004).
+func checkRespErrCall(pass *analysis.Pass, pi *pkgInfo, file *ast.File, call *ast.CallExpr) {
 	info := pass.TypesInfo
 	if isPkgFunc(calleeObj(info, call), pathBridgev2, "WrapRespErrManual") && len(call.Args) == 3 {
 		code, _ := constString(info, call.Args[1])
-		if v, ok := constInt(info, call.Args[2]); ok && (code == "M_LIMIT_EXCEEDED" || rateLimitRegex.MatchString(code)) && v != 429 {
-			report(pass, call.Args[2], LP002, fmt.Sprintf("rate limit returned as HTTP %d; use 429", v))
-		} else if !ok && isPassthroughStatus(info, call.Args[2]) {
+		if v, ok := constInt(info, call.Args[2]); ok {
+			checkStatusArg(pass, file, call.Args[2], v, code == "M_LIMIT_EXCEEDED" || rateLimitRegex.MatchString(code))
+		} else if isPassthroughStatus(info, call.Args[2]) {
 			report(pass, call.Args[2], LP004, "HTTP status copied from a network error code; map it to a fixed status")
 		}
 		return
@@ -305,7 +305,7 @@ func checkRespErrCall(pass *analysis.Pass, call *ast.CallExpr) {
 		}
 		return
 	}
-	if v == 429 {
+	if explicitlyRetriable(pi, info, call) {
 		return
 	}
 	isRate := false
@@ -318,9 +318,55 @@ func checkRespErrCall(pass *analysis.Pass, call *ast.CallExpr) {
 		}
 		return !isRate
 	})
-	if isRate {
-		report(pass, call.Args[0], LP002, fmt.Sprintf("rate limit returned as HTTP %d; use 429", v))
+	checkStatusArg(pass, file, call.Args[0], v, isRate)
+}
+
+func checkStatusArg(pass *analysis.Pass, file *ast.File, arg ast.Expr, v int64, isRate bool) {
+	if !autoRetriedStatuses[v] {
+		return
 	}
+	if isRate && v == 429 {
+		report(pass, arg, LP002, lp002Msg, withFix("Use 400", analysis.TextEdit{Pos: arg.Pos(), End: arg.End(), NewText: []byte(statusBadRequest(file))}))
+	} else {
+		report(pass, arg, LP003, fmt.Sprintf(lp003Fmt, v))
+	}
+}
+
+// checkDefaultLimitExceeded implements LP002 for mautrix.MLimitExceeded used as a RespError without
+// WithStatus, which keeps its default status of 429. Plain references (errors.Is targets) aren't reported.
+func checkDefaultLimitExceeded(pass *analysis.Pass, pi *pkgInfo, file *ast.File, sel *ast.SelectorExpr) {
+	obj := pass.TypesInfo.Uses[sel.Sel]
+	if obj == nil || obj.Pkg() == nil || obj.Pkg().Path() != pathMautrix || obj.Name() != "MLimitExceeded" {
+		return
+	}
+	var outer ast.Expr = sel
+	methods := 0
+	for {
+		ps, ok := pi.parents[outer].(*ast.SelectorExpr)
+		if !ok || ps.X != outer {
+			break
+		}
+		call, ok := pi.parents[ps].(*ast.CallExpr)
+		if !ok || call.Fun != ps {
+			break
+		}
+		if ps.Sel.Name == "WithStatus" {
+			return
+		}
+		methods++
+		outer = call
+	}
+	converted := false
+	if call, ok := pi.parents[outer].(*ast.CallExpr); ok && len(call.Args) == 1 && call.Args[0] == outer {
+		if tv, ok := pass.TypesInfo.Types[call.Fun]; ok && tv.IsType() {
+			converted = true
+		}
+	}
+	if methods == 0 && !converted || explicitlyRetriable(pi, pass.TypesInfo, outer) {
+		return
+	}
+	report(pass, outer, LP002, "mautrix.MLimitExceeded is sent as HTTP 429 by default, which clients retry automatically; add WithStatus(400)",
+		withFix("Use 400", analysis.TextEdit{Pos: outer.End(), End: outer.End(), NewText: []byte(".WithStatus(" + statusBadRequest(file) + ")")}))
 }
 
 // checkSwallowed implements LP006.
@@ -445,4 +491,50 @@ func loginFieldPatterns(pass *analysis.Pass) map[string]bool {
 		})
 	}
 	return out
+}
+
+// explicitlyRetriable reports whether the RespError expression e is part of a method chain that calls
+// WithCanRetry(true). That marks a deliberate retry (e.g. direct media waiting on a phone), not a
+// provisioning failure.
+func explicitlyRetriable(pi *pkgInfo, info *types.Info, e ast.Expr) bool {
+	isCanRetry := func(call *ast.CallExpr, sel *ast.SelectorExpr) bool {
+		return sel.Sel.Name == "WithCanRetry" && len(call.Args) == 1 && isTrue(info, call.Args[0])
+	}
+	var outer ast.Expr = e
+	for {
+		ps, ok := pi.parents[outer].(*ast.SelectorExpr)
+		if !ok || ps.X != outer {
+			break
+		}
+		call, ok := pi.parents[ps].(*ast.CallExpr)
+		if !ok || call.Fun != ps {
+			break
+		}
+		if isCanRetry(call, ps) {
+			return true
+		}
+		outer = call
+	}
+	for cur := e; ; {
+		call, ok := unparen(cur).(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		if isCanRetry(call, sel) {
+			return true
+		}
+		cur = sel.X
+	}
+}
+
+func isTrue(info *types.Info, e ast.Expr) bool {
+	if e == nil {
+		return false
+	}
+	tv, ok := info.Types[e]
+	return ok && tv.Value != nil && tv.Value.Kind() == constant.Bool && constant.BoolVal(tv.Value)
 }

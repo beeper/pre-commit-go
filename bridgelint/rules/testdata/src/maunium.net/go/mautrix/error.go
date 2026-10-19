@@ -5,6 +5,7 @@ type RespError struct {
 	ErrCode    string
 	Err        string
 	StatusCode int
+	CanRetry   bool
 }
 
 func (e RespError) Error() string { return e.ErrCode + ": " + e.Err }
@@ -12,6 +13,8 @@ func (e RespError) Error() string { return e.ErrCode + ": " + e.Err }
 func (e RespError) WithMessage(msg string, args ...any) RespError { e.Err = msg; return e }
 
 func (e RespError) WithStatus(status int) RespError { e.StatusCode = status; return e }
+
+func (e RespError) WithCanRetry(canRetry bool) RespError { e.CanRetry = canRetry; return e }
 
 var (
 	MUnknown       = RespError{ErrCode: "M_UNKNOWN", StatusCode: 500}

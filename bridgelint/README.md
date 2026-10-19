@@ -145,11 +145,16 @@ Login methods are the methods of `LoginProcess*` implementations plus `NetworkCo
 Provisioning methods are `ResolveIdentifier`, `CreateGroup`, `CreateChatWithGhost`, `SearchUsers` and
 `GetContactList`. A plain error from these becomes a bare 500 `M_UNKNOWN`.
 
+Clients retry 429 and 502-504 automatically, and login and provisioning requests must not be retried
+behind the user's back, so `RespError`s never use those statuses. Rate limits are `M_LIMIT_EXCEEDED` with
+400, and upstream failures are 500. A chain that calls `WithCanRetry(true)` (direct media waiting on a
+phone, for example) asks for retries deliberately and isn't reported.
+
 | Rule | Severity | Flags |
 |---|---|---|
 | LP001 | error | A login or provisioning method returns a network error, or a plain error describing bad input ("required", "invalid", "not found", "at least"…), instead of a `bridgev2.RespError`. |
-| LP002 | error | A rate-limit `RespError` (`M_LIMIT_EXCEEDED`, or "rate limit"/"too many requests"/"flood"/"slow down") whose status isn't 429. Autofix sets 429. |
-| LP003 | warning | A temporary or upstream failure returned as 4xx. |
+| LP002 | error | A rate-limit `RespError` (`M_LIMIT_EXCEEDED`, or "rate limit"/"too many requests"/"flood"/"slow down") sent as 429, including `mautrix.MLimitExceeded.WithMessage(...)` without `WithStatus`. Autofix sets 400. |
+| LP003 | error | Any other `RespError` with status 429, 502, 503 or 504. |
 | LP004 | warning | A `RespError` status copied from a network error code (`StatusCode: te.Code`). |
 | LP005 | warning | A `RespError` literal without `StatusCode`, which is sent as 500. |
 | LP006 | error | A provisioning method logs an error and carries on, so the caller is told it succeeded. |

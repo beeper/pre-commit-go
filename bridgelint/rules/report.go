@@ -63,8 +63,8 @@ var (
 	BS011 = rule("BS011", SeverityWarning, "every connect error treated as BAD_CREDENTIALS")
 
 	LP001 = rule("LP001", SeverityError, "plain error from login or provisioning")
-	LP002 = rule("LP002", SeverityError, "rate limit not returned as 429")
-	LP003 = rule("LP003", SeverityWarning, "upstream outage returned as 4xx")
+	LP002 = rule("LP002", SeverityError, "rate limit returned as 429")
+	LP003 = rule("LP003", SeverityError, "RespError returned as 429 or 502-504")
 	LP004 = rule("LP004", SeverityWarning, "network status passed through as HTTP status")
 	LP005 = rule("LP005", SeverityWarning, "RespError without a status code")
 	LP006 = rule("LP006", SeverityError, "error swallowed and success returned")
