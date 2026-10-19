@@ -10,7 +10,7 @@ import (
 
 type Client struct{ c *netlib.Client }
 
-func (c *Client) Send(ctx context.Context, text string) error { // want Send:"constructed .*callee=netlib.Send network=true"
+func (c *Client) Send(ctx context.Context, text string) error { // want Send:"constructed .*callee=netlib.Send"
 	_, err := c.c.Send(ctx, text)
 	if err != nil {
 		return fmt.Errorf("failed to send: %w", err)

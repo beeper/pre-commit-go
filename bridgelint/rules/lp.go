@@ -16,6 +16,7 @@ var LPAnalyzer = &analysis.Analyzer{
 	Doc:  "login and provisioning rules (LP001-LP008): failures must be RespErrors with HTTP statuses that clients won't retry automatically",
 	Run:  runLP,
 
+	Requires:  []*analysis.Analyzer{NetAnalyzer},
 	FactTypes: []analysis.Fact{new(lpErrFact)},
 }
 
@@ -78,7 +79,7 @@ func runLP(pass *analysis.Pass) (any, error) {
 	}
 	pi := infoFor(pass)
 	cfg := ConfigFor(pass)
-	ef := newErrFlow(pi, cfg, cfg.LoginMappers).withFacts(pass, newLPFact)
+	ef := newErrFlow(pass, pi, cfg, cfg.LoginMappers).withFacts(pass, newLPFact)
 	if !pi.isBridge {
 		return nil, nil
 	}
@@ -399,7 +400,7 @@ func checkDuplicateValidation(pass *analysis.Pass, pi *pkgInfo, fd *ast.FuncDecl
 		return
 	}
 	info := pass.TypesInfo
-	ef := newErrFlow(pi, ConfigFor(pass))
+	ef := newErrFlow(pass, pi, ConfigFor(pass))
 	inspectFunc(fd.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
@@ -475,7 +476,7 @@ func loginFieldPatterns(pass *analysis.Pass) map[string]bool {
 							out[s] = true
 						} else if call, ok := unparen(kv.Value).(*ast.CallExpr); ok {
 							if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "String" {
-								ef := newErrFlow(infoFor(pass), ConfigFor(pass))
+								ef := newErrFlow(pass, infoFor(pass), ConfigFor(pass))
 								if s, ok := regexpPattern(pass.TypesInfo, ef, sel.X); ok {
 									out[s] = true
 								}

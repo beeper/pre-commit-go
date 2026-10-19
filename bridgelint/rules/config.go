@@ -24,8 +24,8 @@ type Config struct {
 	Classifiers []string `yaml:"classifiers"`
 	// DisconnectEvents maps a library import path to the event types that signal a disconnect (BS009).
 	DisconnectEvents map[string][]string `yaml:"disconnect_events"`
-	// NetworkPackages are import path prefixes whose errors count as raw network errors.
-	// Defaults to every non-stdlib, non-mautrix import, plus net/http.
+	// NetworkPackages are import path prefixes whose functions all count as reaching the network, for
+	// libraries whose network I/O can't be followed.
 	NetworkPackages []string `yaml:"network_packages"`
 	// HelperDepth is how far errors are followed through same-package helpers.
 	HelperDepth int `yaml:"helper_depth"`

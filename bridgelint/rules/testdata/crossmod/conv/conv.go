@@ -10,7 +10,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 )
 
-func ToNetwork(ctx context.Context, client *netlib.Client, msg *bridgev2.MatrixMessage) (string, error) { // want ToNetwork:"network=true opaque=false statuses=true"
+func ToNetwork(ctx context.Context, client *netlib.Client, msg *bridgev2.MatrixMessage) (string, error) { // want ToNetwork:"statuses=true"
 	if msg.Content == "" {
 		return "", bridgev2.ErrUnsupportedMessageType
 	}

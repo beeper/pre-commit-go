@@ -4,7 +4,6 @@ import (
 	"go/ast"
 	"go/constant"
 	"go/types"
-	"regexp"
 	"strings"
 	"sync"
 
@@ -230,39 +229,6 @@ func (pi *pkgInfo) enclosingFunc(n ast.Node) ast.Node {
 	return nil
 }
 
-// isNetworkPackage reports whether errors from this import path count as raw network/library errors.
-func isNetworkPackage(cfg *Config, self *types.Package, path string) bool {
-	if len(cfg.NetworkPackages) > 0 {
-		for _, prefix := range cfg.NetworkPackages {
-			prefix = strings.TrimSuffix(prefix, "/...")
-			if path == prefix || strings.HasPrefix(path, prefix+"/") {
-				return true
-			}
-		}
-		return false
-	}
-	if path == "net/http" || path == "net" {
-		return true
-	}
-	if path == self.Path() {
-		return false
-	}
-	first, _, _ := strings.Cut(path, "/")
-	if !strings.Contains(first, ".") {
-		return false
-	}
-	if path == pathMautrix || strings.HasPrefix(path, pathMautrix+"/") || strings.HasPrefix(path, "go.mau.fi/util") {
-		return false
-	}
-	if strings.HasPrefix(path, "github.com/rs/zerolog") || isDatabasePackage(path) {
-		return false
-	}
-	if first == "golang.org" {
-		return strings.HasPrefix(path, "golang.org/x/net")
-	}
-	return true
-}
-
 func isPkgFunc(fn types.Object, path string, names ...string) bool {
 	if fn == nil || fn.Pkg() == nil || fn.Pkg().Path() != path {
 		return false
@@ -376,12 +342,4 @@ func inspectFunc(body ast.Node, fn func(ast.Node) bool) {
 		}
 		return fn(n)
 	})
-}
-
-var dbPackageRegex = regexp.MustCompile(`(?i)(^|/)(\w*db|database|store|storage|\w*ids?)(/|$)`)
-
-// isDatabasePackage treats a bridge's own database and ID-parsing packages as internal rather than
-// network: a failed DB query or ID parse is an internal error, not something to classify for the user.
-func isDatabasePackage(path string) bool {
-	return dbPackageRegex.MatchString(path)
 }

@@ -28,6 +28,7 @@ var BSAnalyzer = &analysis.Analyzer{
 	Doc:  "bridge state rules (BS001-BS011): states must carry the right event, action, code and human message, and failures must not be silent",
 	Run:  runBS,
 
+	Requires:  []*analysis.Analyzer{NetAnalyzer},
 	FactTypes: []analysis.Fact{new(bsErrFact), new(humanKeysFact)},
 }
 
@@ -70,7 +71,7 @@ func runBS(pass *analysis.Pass) (any, error) {
 		}
 	}
 	cfg := ConfigFor(pass)
-	ef := newErrFlow(pi, cfg).withFacts(pass, newBSFact)
+	ef := newErrFlow(pass, pi, cfg).withFacts(pass, newBSFact)
 	if !pi.isBridge {
 		return nil, nil
 	}

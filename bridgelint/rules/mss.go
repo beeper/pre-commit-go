@@ -16,6 +16,7 @@ var MSSAnalyzer = &analysis.Analyzer{
 	Doc:  "message status rules (MSS001-MSS006): Matrix handlers must return truthful, human message statuses",
 	Run:  runMSS,
 
+	Requires:  []*analysis.Analyzer{NetAnalyzer},
 	FactTypes: []analysis.Fact{new(mssErrFact)},
 }
 
@@ -34,7 +35,7 @@ func runMSS(pass *analysis.Pass) (any, error) {
 	pi := infoFor(pass)
 	checkIgnores(pass)
 	cfg := ConfigFor(pass)
-	ef := newErrFlow(pi, cfg, cfg.StatusMappers).withFacts(pass, newMSSFact)
+	ef := newErrFlow(pass, pi, cfg, cfg.StatusMappers).withFacts(pass, newMSSFact)
 	if !pi.isBridge {
 		return nil, nil
 	}

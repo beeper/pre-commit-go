@@ -67,13 +67,13 @@ type errFlow struct {
 	factPass   *analysis.Pass
 	newFact    func() errFact
 	modulePath string
-	network    map[*ast.FuncDecl]bool
-	opaque     map[*ast.FuncDecl]bool
+	net        *netReach
 	deferCache map[ast.Node]bool
 }
 
-func newErrFlow(pi *pkgInfo, cfg *Config, mappers ...[]string) *errFlow {
+func newErrFlow(pass *analysis.Pass, pi *pkgInfo, cfg *Config, mappers ...[]string) *errFlow {
 	ef := &errFlow{pi: pi, info: pi.pass.TypesInfo, cfg: cfg, mappers: map[string]bool{}, visiting: map[*ast.FuncDecl]bool{}, deferCache: map[ast.Node]bool{}}
+	ef.net, _ = pass.ResultOf[NetAnalyzer].(*netReach)
 	for _, list := range mappers {
 		for _, m := range list {
 			ef.mappers[m] = true
@@ -244,7 +244,7 @@ func (ef *errFlow) classifyPkgVar(v *types.Var, node ast.Node, depth int) errOri
 		}
 		return o
 	}
-	if isNetworkPackage(ef.cfg, ef.pi.pass.Pkg, v.Pkg().Path()) {
+	if ef.net.pkgReaches(v.Pkg()) {
 		return errOrigin{kind: errRaw, node: node, callee: v}
 	}
 	return errOrigin{kind: errGood}
@@ -370,12 +370,9 @@ func (ef *errFlow) classifyCall(fn ast.Node, call *ast.CallExpr, idx, depth int)
 		}
 		return ef.importedOrigin(f, call)
 	}
-	if isHTTPRoundTrip(f) {
-		return errOrigin{kind: errRaw, node: call, callee: f}
-	}
-	// Network calls take a context; parsers and converters that don't are treated as internal.
-	// net/http's only context-taking function builds a request, which doesn't touch the network.
-	if f.Pkg().Path() != "net/http" && isNetworkPackage(ef.cfg, ef.pi.pass.Pkg, f.Pkg().Path()) && takesContext(sig) {
+	// Errors from library functions that can reach the network are network errors; the rest (parsers,
+	// converters, local stores) are internal.
+	if ef.net.mightReach(f, false) {
 		return errOrigin{kind: errRaw, node: call, callee: f}
 	}
 	return errOrigin{}

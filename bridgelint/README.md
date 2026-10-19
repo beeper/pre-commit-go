@@ -87,7 +87,7 @@ code_format_allowlist: ["slack-%s"]      # BS004: fmt.Sprintf formats known to b
 status_mappers: [wrapSendError]          # MSS001: functions whose result is a proper status
 login_mappers: [wrapLoginError]          # LP001: functions whose result is a proper RespError
 classifiers: [slackAPIErrorCode]         # MSS006: typed error-code accessors
-network_packages:                        # which imports count as network libraries (see below)
+network_packages:                        # packages whose functions all count as reaching the network (see below)
   - github.com/slack-go/slack
   - go.mau.fi/mautrix-slack/pkg/...
 disconnect_events:                       # BS009: event types that signal a dropped connection
@@ -98,20 +98,33 @@ severity:
   GR012: info
 ```
 
-An error counts as a raw network error when it comes from:
+An error counts as a raw network error when it comes from a function that can reach the network.
+bridgelint follows calls from source through every package the bridge depends on, except the standard
+library, bridgev2 and `go.mau.fi/util`, down to these standard library calls:
 
-- `Do`/`RoundTrip` on an HTTP client (net/http or a fork), `http.Get` and friends, a `net.Dial*`, or a
-  read or write on a `Conn`;
-- a function that takes a `context.Context` in a package outside the module, other than the stdlib,
-  mautrix itself, zerolog, and packages that look like a database or ID layer (`*db`, `database`,
-  `store`, `*id`, `*ids`). Set `network_packages` to be explicit about these packages;
-- a function in another package of the module that can reach the network. Packages in the module are
-  analysed from source, so a network library kept in the bridge's repo (`pkg/libgm`, `pkg/signalmeow`)
-  is recognised by what it does, and a context-taking helper that never touches the network (an audio
-  converter, a local store) isn't. Functions that return bridgev2 statuses themselves, like message
-  converters, are followed instead, so the statuses they return count as mapped. Functions that make
-  context-taking calls through interfaces can't be followed and are treated like other libraries.
-  This needs module mode, which is how the hook and `bridgelint ./...` run.
+- an HTTP round trip: `Do`/`RoundTrip` taking a `*Request` on any client (net/http or a fork like fhttp,
+  whose transports send from goroutines), and `http.Get` and friends;
+- a dial in `net` or `crypto/tls`;
+- a read or write on a `net` or `crypto/tls` connection.
+
+Calls through interfaces declared outside the standard library are resolved against the implementations
+visible from the calling package, so a library's transport interface resolves once the bridge imports
+the implementation. Goroutines count when the function waits on a channel they send to. Function
+literals count when they're called or passed to a call, not when they're stored.
+
+Libraries that keep a persistent connection usually write to it in ways that can't be followed without
+tracking values: through a `bufio.Writer` around the connection (websocket libraries), a chain of func
+values (MTProto), or an interface whose implementation the library can't see. So a function also counts
+when it takes a `context.Context`, belongs to a network library or the module being linted, and makes
+one of these calls: a context-taking call through a func value or through an interface with no visible
+implementation, or a read or write on a `bufio.Reader`/`Writer` kept in a struct field. A network
+library is a package that has functions reaching the network, or imports one. A context-taking helper
+that doesn't do any of this (an audio converter, a database layer) never counts.
+
+Functions in the module that return bridgev2 statuses themselves, like message converters, are followed
+instead, so the statuses they return count as mapped. Package-level error values count as network errors
+when their package is a network library. Set `network_packages` to make every function in a package
+count as reaching the network.
 
 Plain `errors.New`/`fmt.Errorf` errors that don't wrap a network error are treated as internal
 invariants (bad portal IDs, impossible states) and aren't reported, except when `CreateLogin` returns
