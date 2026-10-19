@@ -239,16 +239,6 @@ func checkStateLit(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, s
 		return
 	}
 
-	// BS006
-	if sl.event == "UNKNOWN_ERROR" {
-		if ifs, errExpr := enclosingErrCheck(pass, pi, lit); ifs != nil {
-			o := ef.classify(sl.fn, errExpr, ifs.Body.Pos(), 1)
-			if o.kind == errRaw && !classifiesErrors(pass, funcBody(sl.fn)) {
-				report(pass, lit, BS006, fmt.Sprintf("UNKNOWN_ERROR for an unclassified %s; check for rate limits, 5xx, timeouts and network errors first and send TRANSIENT_DISCONNECT (with a retry) for those", describeOrigin(pass.Fset, o)))
-			}
-		}
-	}
-
 	// BS007
 	if sl.event == "TRANSIENT_DISCONNECT" && isLifecycle(pi, sl.fn) {
 		if next := nextStmtAfter(pi, lit); next != nil && exitsFunctionOrLoop(next) && !hasRetrySignal(pass, funcBody(sl.fn)) {
@@ -348,57 +338,6 @@ func sprintfFormat(info *types.Info, e ast.Expr) (string, bool) {
 func isEmptyString(info *types.Info, e ast.Expr) bool {
 	s, ok := constString(info, e)
 	return ok && s == ""
-}
-
-// enclosingErrCheck finds the innermost `if err != nil` whose body contains n.
-func enclosingErrCheck(pass *analysis.Pass, pi *pkgInfo, n ast.Node) (*ast.IfStmt, ast.Expr) {
-	for p := pi.parents[n]; p != nil; p = pi.parents[p] {
-		switch x := p.(type) {
-		case *ast.FuncDecl, *ast.FuncLit:
-			return nil, nil
-		case *ast.IfStmt:
-			if !containsNode(x.Body, n) {
-				continue
-			}
-			if be, ok := x.Cond.(*ast.BinaryExpr); ok && be.Op == token.NEQ {
-				if id, ok := be.Y.(*ast.Ident); ok && id.Name == "nil" && isErrorInterface(pass.TypesInfo.TypeOf(be.X)) {
-					return x, be.X
-				}
-			}
-		}
-	}
-	return nil, nil
-}
-
-func classifiesErrors(pass *analysis.Pass, body ast.Node) bool {
-	found := false
-	ast.Inspect(body, func(n ast.Node) bool {
-		switch x := n.(type) {
-		case *ast.CallExpr:
-			obj := calleeObj(pass.TypesInfo, x)
-			if isPkgFunc(obj, "errors", "As", "AsType") || isPkgFunc(obj, "os", "IsTimeout") {
-				found = true
-			}
-			if sel, ok := x.Fun.(*ast.SelectorExpr); ok && (sel.Sel.Name == "Timeout" || sel.Sel.Name == "Temporary") {
-				found = true
-			}
-		case *ast.SelectorExpr:
-			name := x.Sel.Name
-			if name == "StatusCode" || name == "DeadlineExceeded" || strings.Contains(name, "RateLimit") || strings.Contains(name, "Timeout") {
-				found = true
-			}
-		case *ast.Ident:
-			if strings.Contains(x.Name, "RateLimit") || strings.Contains(x.Name, "rateLimit") {
-				found = true
-			}
-		case *ast.TypeAssertExpr:
-			if isNamed(pass.TypesInfo.TypeOf(x.Type), "net", "Error") {
-				found = true
-			}
-		}
-		return !found
-	})
-	return found
 }
 
 func isLifecycle(pi *pkgInfo, fn ast.Node) bool {
@@ -542,32 +481,6 @@ func isCatchAllAuth(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, sl *stateLit)
 		}
 	}
 	return false
-}
-
-var logMethodNames = map[string]bool{"Msg": true, "Msgf": true, "Printf": true, "Println": true, "Print": true}
-
-func isLogCall(pass *analysis.Pass, call *ast.CallExpr) bool {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || !logMethodNames[sel.Sel.Name] {
-		return false
-	}
-	if sel.Sel.Name == "Msg" || sel.Sel.Name == "Msgf" {
-		return true
-	}
-	t := pass.TypesInfo.TypeOf(sel.X)
-	if t == nil {
-		return isPkgFunc(calleeObj(pass.TypesInfo, call), "log")
-	}
-	return strings.Contains(strings.ToLower(t.String()), "log")
-}
-
-func isErrNilCheck(pass *analysis.Pass, cond ast.Expr) bool {
-	be, ok := cond.(*ast.BinaryExpr)
-	if !ok || be.Op != token.NEQ {
-		return false
-	}
-	id, ok := be.Y.(*ast.Ident)
-	return ok && id.Name == "nil" && isErrorInterface(pass.TypesInfo.TypeOf(be.X))
 }
 
 // checkDisconnectEvents implements BS009.

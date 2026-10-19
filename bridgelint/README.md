@@ -130,7 +130,6 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 | BS003 | error | `Message` built from `err.Error()` or `fmt.Sprintf(..., err)`. Warning when the code has a `BridgeStateHumanErrors` entry, since the text is then silently discarded. |
 | BS004 | error | An error state with no `Error` code, a code that doesn't match `<error_prefix>-<reason>`, or a code built with `fmt.Sprintf`. |
 | BS005 | warning | A code with no `Message` and no `BridgeStateHumanErrors` entry anywhere in the linted packages. |
-| BS006 | warning | `UNKNOWN_ERROR` for a raw network error in a function that never checks for rate limits, timeouts or status codes. |
 | BS007 | error | In `Connect` or a goroutine, `TRANSIENT_DISCONNECT` followed by `return`/`break` with nothing scheduling a reconnect. |
 | BS009 | warning | An event-handler type switch for a configured library with no case for its disconnect events. |
 | BS010 | warning | `TRANSIENT_DISCONNECT` under a 401/403/auth check. |
@@ -157,7 +156,6 @@ phone, for example) asks for retries deliberately and isn't reported.
 | LP003 | error | Any other `RespError` with status 429, 502, 503 or 504. |
 | LP004 | warning | A `RespError` status copied from a network error code (`StatusCode: te.Code`). |
 | LP005 | warning | A `RespError` literal without `StatusCode`, which is sent as 500. |
-| LP006 | error | A provisioning method logs an error and carries on, so the caller is told it succeeded. |
 | LP007 | info | A `RespError` literal for a standard Matrix code; use `mautrix.MLimitExceeded.WithMessage(...)` and friends so the status can't drift from the code. Autofix rewrites it. |
 | LP008 | info | A login method re-checks a submitted field against the same regex as the field's `Pattern`. |
 
@@ -193,6 +191,12 @@ These were considered and left out because they can't be checked without false p
 - Map fields that only grow, retry counters that never reset, unchecked indexing of protocol data
   (`nilaway` covers part of it) and unlocked metadata maps (run tests with `-race`).
 - Missing certainty on failures returned before the network call.
+- Errors in provisioning methods that are logged and not returned: these are usually best-effort steps
+  after the main action has succeeded (saving the portal or setting an avatar after a group was created),
+  where returning an error would make the client retry something that already happened.
+- `UNKNOWN_ERROR` for an unclassified connect error: the framework already reconnects after
+  `UNKNOWN_ERROR`, and libraries often classify and retry connect errors themselves (whatsmeow does with
+  `InitialAutoReconnect`), which isn't visible from the bridge.
 - A golangci-lint plugin. The analyzers in `rules` are plain `go/analysis` analyzers, so wiring one up
   is mostly boilerplate.
 

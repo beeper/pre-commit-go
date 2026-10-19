@@ -34,7 +34,7 @@ func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMe
 func (c *Client) Connect(ctx context.Context) {
 	err := c.client.Connect(ctx)
 	if err != nil {
-		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateUnknownError, Error: "ex-connect-failed", Message: "failed to connect"}) // want `BS006: UNKNOWN_ERROR for an unclassified raw error from netlib.Connect`
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateUnknownError, Error: "ex-connect-failed", Message: "failed to connect"})
 		return
 	}
 	go c.pollLoop(ctx)

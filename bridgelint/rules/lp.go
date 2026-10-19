@@ -100,9 +100,6 @@ func runLP(pass *analysis.Pass) (any, error) {
 				report(pass, ret, LP001, fmt.Sprintf("%s returns %s, which reaches clients as a bare 500 M_UNKNOWN; return a bridgev2.RespError with a matching status (or wrap with bridgev2.WrapRespErr)", fd.Name.Name, describeOrigin(pass.Fset, o)))
 			}
 		})
-		if pi.scopes[fd]&ScopeProvisioning != 0 {
-			checkSwallowed(pass, fd)
-		}
 		if pi.scopes[fd]&ScopeLogin != 0 {
 			checkDuplicateValidation(pass, pi, fd)
 		}
@@ -367,32 +364,6 @@ func checkDefaultLimitExceeded(pass *analysis.Pass, pi *pkgInfo, file *ast.File,
 	}
 	report(pass, outer, LP002, "mautrix.MLimitExceeded is sent as HTTP 429 by default, which clients retry automatically; add WithStatus(400)",
 		withFix("Use 400", analysis.TextEdit{Pos: outer.End(), End: outer.End(), NewText: []byte(".WithStatus(" + statusBadRequest(file) + ")")}))
-}
-
-// checkSwallowed implements LP006.
-func checkSwallowed(pass *analysis.Pass, fd *ast.FuncDecl) {
-	inspectFunc(fd.Body, func(n ast.Node) bool {
-		ifs, ok := n.(*ast.IfStmt)
-		if !ok || !isErrNilCheck(pass, ifs.Cond) || ifs.Else != nil {
-			return true
-		}
-		logged := false
-		for _, s := range ifs.Body.List {
-			es, ok := s.(*ast.ExprStmt)
-			if !ok {
-				return true
-			}
-			call, ok := es.X.(*ast.CallExpr)
-			if !ok || !isLogCall(pass, call) {
-				return true
-			}
-			logged = true
-		}
-		if logged {
-			report(pass, ifs, LP006, fmt.Sprintf("%s logs this error and carries on, so the caller is told it succeeded; return a RespError", fd.Name.Name))
-		}
-		return true
-	})
 }
 
 // checkDuplicateValidation implements LP008.

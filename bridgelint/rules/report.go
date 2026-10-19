@@ -56,7 +56,6 @@ var (
 	BS003 = rule("BS003", SeverityError, "raw error text in bridge state Message")
 	BS004 = rule("BS004", SeverityError, "error state without a stable code")
 	BS005 = rule("BS005", SeverityWarning, "bridge state code without a human message")
-	BS006 = rule("BS006", SeverityWarning, "UNKNOWN_ERROR for a classifiable failure")
 	BS007 = rule("BS007", SeverityError, "TRANSIENT_DISCONNECT with no retry")
 	BS009 = rule("BS009", SeverityWarning, "library disconnect events not handled")
 	BS010 = rule("BS010", SeverityWarning, "TRANSIENT_DISCONNECT for a permanent condition")
@@ -67,7 +66,6 @@ var (
 	LP003 = rule("LP003", SeverityError, "RespError returned as 429 or 502-504")
 	LP004 = rule("LP004", SeverityWarning, "network status passed through as HTTP status")
 	LP005 = rule("LP005", SeverityWarning, "RespError without a status code")
-	LP006 = rule("LP006", SeverityError, "error swallowed and success returned")
 	LP007 = rule("LP007", SeverityInfo, "RespError struct literal for a standard Matrix error code")
 	LP008 = rule("LP008", SeverityInfo, "connector re-validates input the login step already describes")
 

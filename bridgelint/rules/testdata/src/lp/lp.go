@@ -32,7 +32,7 @@ func (c *Client) ResolveIdentifier(ctx context.Context, identifier string, creat
 		return nil, bridgev2.RespError(mautrix.MInvalidParam.WithMessage("invalid identifier"))
 	}
 	_, err := c.client.Lookup(ctx, identifier)
-	if err != nil { // want `LP006: ResolveIdentifier logs this error and carries on`
+	if err != nil {
 		zlog.Err(err).Msg("lookup failed")
 	}
 	_, err = c.client.Lookup(ctx, identifier)
