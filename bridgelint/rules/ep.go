@@ -1,7 +1,6 @@
 package rules
 
 import (
-	"fmt"
 	"go/ast"
 	"go/token"
 	"regexp"
@@ -44,8 +43,8 @@ func runEP(pass *analysis.Pass) (any, error) {
 				}
 			case *ast.CallExpr:
 				obj := calleeObj(info, x)
-				if isPkgFunc(obj, "strings", "Contains", "HasPrefix", "HasSuffix", "EqualFold", "Index") && len(x.Args) > 0 && isErrText(x.Args[0]) {
-					report(pass, x, EP001, fmt.Sprintf("error matched with strings.%s(err.Error(), ...); use errors.Is/errors.As or a typed code accessor", obj.Name()))
+				if isPkgFunc(obj, "strings", "EqualFold") && len(x.Args) > 0 && isErrText(x.Args[0]) {
+					report(pass, x, EP001, "error matched with strings.EqualFold(err.Error(), ...); use errors.Is/errors.As or a typed code accessor")
 				}
 				if !pi.isBridge && isPkgFunc(obj, "fmt", "Errorf") {
 					checkUntypedHTTPError(pass, x)

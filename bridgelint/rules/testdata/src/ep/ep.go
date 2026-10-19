@@ -18,7 +18,7 @@ func match(err error) bool {
 	case "token_revoked":
 		return true
 	}
-	if strings.Contains(err.Error(), "http 401") { // want `EP001: error matched with strings.Contains`
+	if strings.Contains(err.Error(), "http 401") {
 		return true
 	}
 	return errors.Is(err, bridgev2.ErrNotLoggedIn)

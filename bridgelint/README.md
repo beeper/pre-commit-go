@@ -8,6 +8,11 @@ background loops that fail silently, and a few general Go reliability problems.
 It's type-aware: functions are classified by the bridgev2 interface their receiver implements
 (`NetworkAPI`, `LoginProcess*`, `NetworkConnector`), not by name.
 
+It's a best-practices linter, so it prefers missing a problem to flagging correct code. Rules only fire
+on patterns that are wrong wherever they appear; heuristics that need knowledge of the protocol or the
+author's intent aren't included. If a rule needs suppression comments to be usable on a bridge, fix the
+rule.
+
 ## Usage
 
 ```sh
@@ -54,7 +59,7 @@ edits that move lines around.
 
 ### Suppressing a finding
 
-Put a comment on the line, or the line above:
+This should be rare. Put a comment on the line, or the line above:
 
 ```go
 //bridgelint:ignore BS002 removed-from-team is deliberately left on the RELOGIN default
@@ -62,13 +67,9 @@ Put a comment on the line, or the line above:
 
 A reason is required. An ignore without rule IDs or without a reason is reported as `BL000`.
 
-Functions that map errors to message statuses or `RespError`s can be marked so their results count as
-handled:
-
-```go
-//bridgelint:status-mapper
-func wrapSendError(err error) error { ... }
-```
+Errors are followed through same-package helpers, so a mapper that returns `WrapErrorInStatus(...)` or a
+`RespError` is recognised automatically. Mappers that sometimes return the error unchanged can be listed
+in `status_mappers`/`login_mappers` in the config.
 
 ### Configuration
 
@@ -92,9 +93,17 @@ severity:
   GR012: info
 ```
 
-By default, errors returned from any non-stdlib import (plus `net/http`) count as raw network errors,
-except mautrix itself, zerolog, and packages that look like a database or ID layer (`*db`, `database`,
-`store`, `*id`, `*ids`). Set `network_packages` to be explicit.
+An error counts as a raw network error when it comes from a function that takes a `context.Context`
+in a non-stdlib package (or `net/http`), other than mautrix itself, zerolog, and packages that look like
+a database or ID layer (`*db`, `database`, `store`, `*id`, `*ids`). Set `network_packages` to be
+explicit about the packages.
+
+Plain `errors.New`/`fmt.Errorf` errors that don't wrap a network error are treated as internal
+invariants (bad portal IDs, impossible states) and aren't reported, except where the text itself shows
+they're user-facing (MSS002, LP001).
+
+Rules that depend on newer bridgev2 behaviour check the module's `maunium.net/go/mautrix` version (from
+`go list -m`) and stay quiet when the pinned version doesn't have it.
 
 ## Rules
 
@@ -105,25 +114,24 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 
 | Rule | Severity | Flags |
 |---|---|---|
-| MSS001 | error | A handler returns `errors.New`/`fmt.Errorf` or a raw library error, directly or through a same-package helper. |
-| MSS002 | error | A permanent rejection stays retriable: `ErrorReason` `Unsupported`/`NoPermission`/`TooOld` without `WithStatus(event.MessageStatusFail)`, or a message that reads as permanent ("not supported", "too large", "not allowed"…). Use a `bridgev2.Err*` sentinel where one fits. |
+| MSS001 | error | A handler returns a network error unmapped: as is, or wrapped in `fmt.Errorf`, directly or through a same-package helper. |
+| MSS002 | error | A permanent rejection stays retriable: `ErrorReason` `Unsupported`/`NoPermission`/`TooOld` without `WithStatus(event.MessageStatusFail)`, or a plain error whose text says it's permanent ("not supported", "too large", "only your own", "not allowed"…). Use a `bridgev2.Err*` sentinel where one fits. |
 | MSS003 | warning | Raw error text shown to users: `WithErrorAsMessage()` on a library error or on `fmt.Errorf` that formats another error or status code, or `WithMessage(err.Error())`. |
 | MSS004 | warning | `WithIsCertain(true)` on a timeout. |
 | MSS005 | info | A status with a message and certainty but no `ErrorReason`. |
-| MSS006 | warning | The package has a typed error classifier (a `func(error) string/int` that calls `errors.As`) but a handler returns library errors without using it. |
+| MSS006 | warning | The package has a typed error classifier (a `func(error) string/int` named like `*Code`/`*Kind`/`*Status` that calls `errors.As`, or one listed in `classifiers`) but a handler returns network errors without using it. |
 
 ### Bridge states (BS)
 
 | Rule | Severity | Flags |
 |---|---|---|
-| BS001 | info | An explicit `UserActionRelogin` on `BAD_CREDENTIALS`; bridgev2 already defaults to it. |
+| BS001 | info | An explicit `UserActionRelogin` on `BAD_CREDENTIALS`, when the pinned mautrix already defaults to it (after v0.32.0). |
 | BS002 | error | A restriction, ban, checkpoint or consent code that isn't `BAD_CREDENTIALS` + `OPEN_NATIVE`, or `UserActionRestart` with `BAD_CREDENTIALS`. Autofix sets `OPEN_NATIVE`. |
 | BS003 | error | `Message` built from `err.Error()` or `fmt.Sprintf(..., err)`. Warning when the code has a `BridgeStateHumanErrors` entry, since the text is then silently discarded. |
 | BS004 | error | An error state with no `Error` code, a code that doesn't match `<error_prefix>-<reason>`, or a code built with `fmt.Sprintf`. |
 | BS005 | warning | A code with no `Message` and no `BridgeStateHumanErrors` entry anywhere in the linted packages. |
 | BS006 | warning | `UNKNOWN_ERROR` for a raw network error in a function that never checks for rate limits, timeouts or status codes. |
 | BS007 | error | In `Connect` or a goroutine, `TRANSIENT_DISCONNECT` followed by `return`/`break` with nothing scheduling a reconnect. |
-| BS008 | error | In a long-running goroutine loop (or an `On*Error`/`Handle*Error` callback), a network error that is only logged, where nothing in that goroutine sends a bridge state. |
 | BS009 | warning | An event-handler type switch for a configured library with no case for its disconnect events. |
 | BS010 | warning | `TRANSIENT_DISCONNECT` under a 401/403/auth check. |
 | BS011 | warning | `BAD_CREDENTIALS` for every connect error: in a `default`/`else` branch, or directly under `if err != nil` after a `Connect` call. |
@@ -139,7 +147,7 @@ Provisioning methods are `ResolveIdentifier`, `CreateGroup`, `CreateChatWithGhos
 
 | Rule | Severity | Flags |
 |---|---|---|
-| LP001 | error | A login or provisioning method returns a plain or raw error instead of a `bridgev2.RespError`. |
+| LP001 | error | A login or provisioning method returns a network error, or a plain error describing bad input ("required", "invalid", "not found", "at least"…), instead of a `bridgev2.RespError`. |
 | LP002 | error | A rate-limit `RespError` (`M_LIMIT_EXCEEDED`, or "rate limit"/"too many requests"/"flood"/"slow down") whose status isn't 429. Autofix sets 429. |
 | LP003 | warning | A temporary or upstream failure returned as 4xx. |
 | LP004 | warning | A `RespError` status copied from a network error code (`StatusCode: te.Code`). |
@@ -152,7 +160,7 @@ Provisioning methods are `ResolveIdentifier`, `CreateGroup`, `CreateChatWithGhos
 
 | Rule | Severity | Flags |
 |---|---|---|
-| EP001 | error | Errors matched by string: `err.Error() == "..."`, `switch err.Error()`, `strings.Contains(err.Error(), ...)`. |
+| EP001 | error | Errors matched by exact string: `err.Error() == "..."`, `switch err.Error()`, `strings.EqualFold(err.Error(), ...)`. Substring matches aren't flagged, since some servers only give text. |
 | EP002 | warning | In library packages (ones that don't import bridgev2), an HTTP status formatted into a plain error, so callers can't tell 429 from 403 from 5xx. |
 | EP003 | info | `errors.Join` returned from a Matrix handler or used as a user-facing message. |
 
@@ -161,21 +169,25 @@ Provisioning methods are `ResolveIdentifier`, `CreateGroup`, `CreateChatWithGhos
 | Rule | Severity | Flags |
 |---|---|---|
 | GR001 | warning | An `*http.Response` whose body is never closed and isn't passed on. |
-| GR002 | warning | `http.Get`/`Post`/`Head`, `http.NewRequest` without a context, `http.DefaultClient`, or `http.Client{}` without `Timeout`. |
+| GR002 | warning | `http.Get`/`Post`/`Head`, `http.NewRequest` without a context, or `http.DefaultClient`. |
 | GR003 | warning | A request built once with a body and re-sent with `Do` inside a loop; the body is empty on retries. |
-| GR004 | error | `os.Exit`, `log.Fatal*`/`Panic*`, zerolog `Fatal()`/`Panic()` or `panic` outside `main`, `init` and `Must*` functions. |
+| GR004 | error | `os.Exit`, `log.Fatal*`/`Panic*` or zerolog `Fatal()`/`Panic()` outside `main`, `init` and `Must*` functions. Plain `panic` isn't flagged: panics are alerted on and fixed at the source. |
 | GR007 | warning | A blocking channel send in a Matrix handler (no `select` with `default` or `ctx.Done()`). |
 | GR008 | warning | A cursor/seq/checkpoint field assigned after a loop that calls `QueueRemoteEvent`, before the events are handled. |
-| GR009 | warning | A package-level map, slice, struct or pointer written at runtime in a bridge package, shared by every login. |
+| GR009 | warning | A package-level map or slice written at runtime in a bridge package, shared by every login. |
 | GR011 | warning | `GetCapabilities` changes `RoomFeatures` fields but never the `ID`, so clients cache the wrong features. |
-| GR012 | warning | A map field that's only ever inserted into. |
-| GR013 | warning | `LogoutRemote` that never disconnects or stops the client. |
+| GR013 | warning | `LogoutRemote` that never disconnects or stops the client, when the pinned mautrix doesn't disconnect after `LogoutRemote` itself (v0.32.0 and earlier). |
 
-### Not implemented yet
+### Deliberately not included
 
-- MSS004's second half: missing certainty on failures returned before the network call.
-- Retry counters that never reset (GR005), unchecked indexing of protocol data (GR006; `nilaway` covers
-  part of it) and unlocked metadata maps (GR010; run tests with `-race`).
+These were considered and left out because they can't be checked without false positives:
+
+- Failures that are only logged in a background loop ("dead but green"): whether a loop is a
+  connection loop or batch work, and whether something else reports the failure, isn't visible
+  statically.
+- Map fields that only grow, retry counters that never reset, unchecked indexing of protocol data
+  (`nilaway` covers part of it) and unlocked metadata maps (run tests with `-race`).
+- Missing certainty on failures returned before the network call.
 - A golangci-lint plugin. The analyzers in `rules` are plain `go/analysis` analyzers, so wiring one up
   is mostly boilerplate.
 

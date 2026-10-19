@@ -58,7 +58,6 @@ var (
 	BS005 = rule("BS005", SeverityWarning, "bridge state code without a human message")
 	BS006 = rule("BS006", SeverityWarning, "UNKNOWN_ERROR for a classifiable failure")
 	BS007 = rule("BS007", SeverityError, "TRANSIENT_DISCONNECT with no retry")
-	BS008 = rule("BS008", SeverityError, "runtime failure that is only logged")
 	BS009 = rule("BS009", SeverityWarning, "library disconnect events not handled")
 	BS010 = rule("BS010", SeverityWarning, "TRANSIENT_DISCONNECT for a permanent condition")
 	BS011 = rule("BS011", SeverityWarning, "every connect error treated as BAD_CREDENTIALS")
@@ -82,9 +81,8 @@ var (
 	GR004 = rule("GR004", SeverityError, "process exit or panic in connector or library code")
 	GR007 = rule("GR007", SeverityWarning, "blocking channel send in a Matrix handler")
 	GR008 = rule("GR008", SeverityWarning, "sync cursor saved before queued events are handled")
-	GR009 = rule("GR009", SeverityWarning, "package-level mutable state shared across logins")
+	GR009 = rule("GR009", SeverityWarning, "package-level map or slice written at runtime, shared across logins")
 	GR011 = rule("GR011", SeverityWarning, "RoomFeatures.ID is constant while capabilities vary")
-	GR012 = rule("GR012", SeverityWarning, "map field that only grows")
 	GR013 = rule("GR013", SeverityWarning, "LogoutRemote doesn't stop the client")
 )
 

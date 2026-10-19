@@ -18,7 +18,10 @@ var LPAnalyzer = &analysis.Analyzer{
 }
 
 var (
-	rateLimitRegex     = regexp.MustCompile(`(?i)rate.?limit|too many requests|flood|slow ?down`)
+	rateLimitRegex = regexp.MustCompile(`(?i)rate.?limit|too many requests|flood|slow ?down`)
+	// userInputRegex matches plain login/provisioning errors that describe bad user input, which should be 4xx.
+	// Other plain errors are treated as internal invariants and not reported.
+	userInputRegex     = regexp.MustCompile(`(?i)\b(required|empty|missing|invalid|not found|no \w+( \w+)? (found|matched)|multiple \w+( \w+)? matched|must|too (few|many|long|short)|at least|unknown (login )?flow)\b`)
 	temporaryRegex     = regexp.MustCompile(`(?i)temporar|unavailable|outage|try again later`)
 	temporaryCodeRegex = regexp.MustCompile(`(?i)temporar|outage`)
 )
@@ -85,7 +88,7 @@ func runLP(pass *analysis.Pass) (any, error) {
 			continue
 		}
 		ef.returnedErrors(fd, idx, func(ret *ast.ReturnStmt, o errOrigin) {
-			if o.kind == errConstructed || o.kind == errRaw {
+			if o.kind == errRaw || o.kind == errConstructed && (o.callee != nil || userInputRegex.MatchString(o.msg)) {
 				report(pass, ret, LP001, fmt.Sprintf("%s returns %s, which reaches clients as a bare 500 M_UNKNOWN; return a bridgev2.RespError with a matching status (or wrap with bridgev2.WrapRespErr)", fd.Name.Name, describeOrigin(pass.Fset, o)))
 			}
 		})

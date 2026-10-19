@@ -17,7 +17,9 @@ var MSSAnalyzer = &analysis.Analyzer{
 	Run:  runMSS,
 }
 
-var permanentRegex = regexp.MustCompile(`(?i)not supported|unsupported|too (large|long|old)|exceeds|limit|only (your|their) own|cannot|can't|not allowed|forbidden|invalid`)
+var permanentRegex = regexp.MustCompile(`(?i)not supported|unsupported|(doesn't|does not|don't|do not) support|too (large|long|big)|exceeds the|only (your|their) own|not allowed|(can't|cannot) be (sent|edited|deleted|used)`)
+
+var classifierNameRegex = regexp.MustCompile(`(?i)(code|kind|class|reason|status)`)
 
 var permanentReasons = map[string]bool{
 	"MessageStatusUnsupported":  true,
@@ -40,7 +42,7 @@ func runMSS(pass *analysis.Pass) (any, error) {
 		if idx < 0 {
 			continue
 		}
-		usesClassifier := callsAny(pass, fd.Body, classifiers)
+		usesClassifier := callsAny(pass, pi, fd.Body, classifiers, 2)
 		var firstRaw ast.Node
 		ef.returnedErrors(fd, idx, func(ret *ast.ReturnStmt, o errOrigin) {
 			switch o.kind {
@@ -49,9 +51,17 @@ func runMSS(pass *analysis.Pass) (any, error) {
 					report(pass, ret, MSS002, fmt.Sprintf("%s returns %s, which reads as permanent but becomes a retriable status; return a bridgev2.Err* sentinel or WrapErrorInStatus(...).WithStatus(event.MessageStatusFail) with an ErrorReason", fd.Name.Name, describeOrigin(pass.Fset, o)))
 					return
 				}
-				report(pass, ret, MSS001, fmt.Sprintf("%s returns %s; wrap it in a bridgev2.MessageStatus or use a bridgev2.Err* sentinel", fd.Name.Name, describeOrigin(pass.Fset, o)))
+				if o.callee == nil {
+					// A plain error that wraps nothing from the network is usually an internal
+					// invariant; a generic failure status is fine for those.
+					return
+				}
+				report(pass, ret, MSS001, fmt.Sprintf("%s returns %s; map the network error to a bridgev2.MessageStatus", fd.Name.Name, describeOrigin(pass.Fset, o)))
+				if firstRaw == nil {
+					firstRaw = ret
+				}
 			case errRaw:
-				report(pass, ret, MSS001, fmt.Sprintf("%s returns %s; map it to a bridgev2.MessageStatus (or mark the mapper with //bridgelint:status-mapper)", fd.Name.Name, describeOrigin(pass.Fset, o)))
+				report(pass, ret, MSS001, fmt.Sprintf("%s returns %s; map it to a bridgev2.MessageStatus", fd.Name.Name, describeOrigin(pass.Fset, o)))
 				if firstRaw == nil {
 					firstRaw = ret
 				}
@@ -190,7 +200,7 @@ func findClassifiers(pi *pkgInfo, cfg *Config) map[*types.Func]bool {
 			continue
 		}
 		basic, ok := sig.Results().At(0).Type().Underlying().(*types.Basic)
-		if !ok || basic.Info()&(types.IsString|types.IsInteger) == 0 {
+		if !ok || basic.Info()&(types.IsString|types.IsInteger) == 0 || !classifierNameRegex.MatchString(obj.Name()) {
 			continue
 		}
 		callsAs := false
@@ -216,8 +226,8 @@ func classifierNames(m map[*types.Func]bool) []string {
 	return names
 }
 
-func callsAny(pass *analysis.Pass, body ast.Node, fns map[*types.Func]bool) bool {
-	if len(fns) == 0 {
+func callsAny(pass *analysis.Pass, pi *pkgInfo, body ast.Node, fns map[*types.Func]bool, depth int) bool {
+	if len(fns) == 0 || body == nil {
 		return false
 	}
 	found := false
@@ -225,6 +235,10 @@ func callsAny(pass *analysis.Pass, body ast.Node, fns map[*types.Func]bool) bool
 		if call, ok := n.(*ast.CallExpr); ok {
 			if f, ok := calleeObj(pass.TypesInfo, call).(*types.Func); ok && fns[f.Origin()] {
 				found = true
+			} else if depth > 0 {
+				if fd := pi.declOf(call); fd != nil && callsAny(pass, pi, fd.Body, fns, depth-1) {
+					found = true
+				}
 			}
 		}
 		return !found

@@ -68,7 +68,7 @@ func (c *Client) states(err error) {
 func (c *Client) pollLoop(ctx context.Context) {
 	for {
 		_, err := c.client.Poll(ctx)
-		if err != nil { // want `BS008: runtime failure is only logged`
+		if err != nil {
 			zlog.Err(err).Msg("poll failed")
 			continue
 		}

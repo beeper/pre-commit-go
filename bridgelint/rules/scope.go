@@ -230,15 +230,6 @@ func (pi *pkgInfo) enclosingFunc(n ast.Node) ast.Node {
 	return nil
 }
 
-func (pi *pkgInfo) enclosingDecl(n ast.Node) *ast.FuncDecl {
-	for p := pi.parents[n]; p != nil; p = pi.parents[p] {
-		if fd, ok := p.(*ast.FuncDecl); ok {
-			return fd
-		}
-	}
-	return nil
-}
-
 // isNetworkPackage reports whether errors from this import path count as raw network/library errors.
 func isNetworkPackage(cfg *Config, self *types.Package, path string) bool {
 	if len(cfg.NetworkPackages) > 0 {

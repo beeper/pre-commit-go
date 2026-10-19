@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -61,11 +62,28 @@ func main() {
 		return
 	}
 	rules.ConfigOverride = *configPath
+	rules.MautrixVersion = mautrixVersion()
 	patterns := flag.Args()
 	if len(patterns) == 0 {
 		patterns = []string{"./..."}
 	}
 	os.Exit(run(patterns))
+}
+
+// mautrixVersion asks the go command which mautrix the current module builds against.
+func mautrixVersion() string {
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Version}}|{{with .Replace}}{{.Version}}|{{.Path}}{{end}}", "maunium.net/go/mautrix").Output()
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(strings.TrimSpace(string(out)), "|")
+	if len(parts) >= 3 && parts[2] != "" {
+		if parts[1] == "" {
+			return "local"
+		}
+		return parts[1]
+	}
+	return parts[0]
 }
 
 func printRules() {

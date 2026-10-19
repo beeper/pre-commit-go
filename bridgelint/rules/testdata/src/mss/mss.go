@@ -26,7 +26,7 @@ var errLocalSentinel = errors.New("only your own messages can be edited")
 
 func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	if msg.Content == "" {
-		return nil, errors.New("no message to send") // want `MSS001: HandleMatrixMessage returns plain error "no message to send"`
+		return nil, errors.New("no message to send")
 	}
 	if len(msg.Content) > 1000 {
 		return nil, fmt.Errorf("message is too long (max %d characters)", 1000) // want `MSS002: HandleMatrixMessage returns plain error .*reads as permanent`
@@ -85,8 +85,12 @@ type codeErr struct{ code string }
 
 func (c *codeErr) Error() string { return c.code }
 
-//bridgelint:status-mapper
-func mapped(err error) error { return err }
+func mapped(err error) error {
+	if err == nil {
+		return nil
+	}
+	return bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusNetworkError)
+}
 
 func statuses(err error) []error {
 	return []error{

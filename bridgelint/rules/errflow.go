@@ -52,18 +52,6 @@ func newErrFlow(pi *pkgInfo, cfg *Config, mappers ...[]string) *errFlow {
 	return ef
 }
 
-func isMapperDoc(fd *ast.FuncDecl) bool {
-	if fd == nil || fd.Doc == nil {
-		return false
-	}
-	for _, c := range fd.Doc.List {
-		if strings.Contains(c.Text, "bridgelint:status-mapper") || strings.Contains(c.Text, "bridgelint:login-mapper") {
-			return true
-		}
-	}
-	return false
-}
-
 // errorResultIndex returns the index of the trailing error result, or -1.
 func errorResultIndex(sig *types.Signature) int {
 	if sig == nil || sig.Results().Len() == 0 {
@@ -264,9 +252,6 @@ func (ef *errFlow) classifyCall(fn ast.Node, call *ast.CallExpr, idx, depth int)
 		return errOrigin{kind: errGood}
 	}
 	if fd := ef.pi.decls[f]; fd != nil {
-		if isMapperDoc(fd) {
-			return errOrigin{kind: errGood}
-		}
 		if depth <= 0 || ef.visiting[fd] {
 			return errOrigin{}
 		}
@@ -289,7 +274,8 @@ func (ef *errFlow) classifyCall(fn ast.Node, call *ast.CallExpr, idx, depth int)
 		})
 		return worst
 	}
-	if f.Pkg() != nil && isNetworkPackage(ef.cfg, ef.pi.pass.Pkg, f.Pkg().Path()) {
+	// Network calls take a context; parsers and converters that don't are treated as internal.
+	if f.Pkg() != nil && isNetworkPackage(ef.cfg, ef.pi.pass.Pkg, f.Pkg().Path()) && takesContext(sig) {
 		return errOrigin{kind: errRaw, node: call, callee: f}
 	}
 	return errOrigin{}
@@ -408,4 +394,13 @@ func shortPos(fset *token.FileSet, n ast.Node) string {
 		name = name[i+1:]
 	}
 	return fmt.Sprintf("%s:%d", name, p.Line)
+}
+
+func takesContext(sig *types.Signature) bool {
+	for i := 0; i < sig.Params().Len(); i++ {
+		if isNamed(sig.Params().At(i).Type(), "context", "Context") {
+			return true
+		}
+	}
+	return false
 }

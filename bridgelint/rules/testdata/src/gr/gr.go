@@ -53,7 +53,7 @@ func (c *Client) fetch(ctx context.Context) error {
 	defer resp2.Body.Close()
 	_, _ = http.NewRequest(http.MethodGet, "https://example.com", nil) // want `GR002: http.NewRequest has no context`
 	_ = http.DefaultClient                                             // want `GR002: http.DefaultClient has no timeout`
-	_ = &http.Client{}                                                 // want `GR002: http.Client without Timeout`
+	_ = &http.Client{}
 	return nil
 }
 
@@ -76,7 +76,7 @@ func (c *Client) die(err error) {
 	if err != nil {
 		os.Exit(1) // want `GR004: os.Exit in connector or library code`
 	}
-	panic("unreachable") // want `GR004: panic in connector or library code`
+	panic("unreachable")
 }
 
 func MustParse(s string) string {
@@ -96,7 +96,7 @@ func (c *Client) sync(ctx context.Context) {
 
 func (c *Client) remember(k string) {
 	sharedCaps[k] = true // want `GR009: package-level sharedCaps is written at runtime`
-	c.cache[k] = "v"     // want `GR012: map field cache is only ever inserted into`
+	c.cache[k] = "v"
 	c.pending[k] = true
 	delete(c.pending, k)
 }

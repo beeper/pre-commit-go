@@ -8,7 +8,6 @@ import (
 	"os"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
@@ -59,7 +58,6 @@ func runBS(pass *analysis.Pass) (any, error) {
 	for _, sl := range collectStateLits(pass, pi) {
 		checkStateLit(pass, pi, ef, cfg, sl, keys, codeShape)
 	}
-	checkLoggedOnly(pass, pi, ef)
 	checkDisconnectEvents(pass, cfg)
 	return nil, nil
 }
@@ -187,7 +185,7 @@ func checkStateLit(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, s
 	isErrorState := sl.event != "" && !slices.Contains([]string{"CONNECTED", "CONNECTING", "BACKFILLING", "STARTING", "RUNNING", "UNCONFIGURED"}, sl.event)
 
 	// BS001
-	if sl.event == "BAD_CREDENTIALS" && sl.action == "RELOGIN" {
+	if sl.event == "BAD_CREDENTIALS" && sl.action == "RELOGIN" && FrameworkHas(FeatureReloginDefault) {
 		report(pass, sl.fields["UserAction"], BS001, "BAD_CREDENTIALS already defaults to RELOGIN in bridgev2; the explicit UserAction is redundant")
 	}
 
@@ -563,102 +561,6 @@ func isLogCall(pass *analysis.Pass, call *ast.CallExpr) bool {
 	return strings.Contains(strings.ToLower(t.String()), "log")
 }
 
-func sendsState(pass *analysis.Pass, pi *pkgInfo, body ast.Node, depth int, seen map[ast.Node]bool) bool {
-	if body == nil || seen[body] {
-		return false
-	}
-	seen[body] = true
-	found := false
-	ast.Inspect(body, func(n ast.Node) bool {
-		if found {
-			return false
-		}
-		switch x := n.(type) {
-		case *ast.CompositeLit:
-			if isNamed(pass.TypesInfo.TypeOf(x), pathStatus, "BridgeState") {
-				found = true
-			}
-		case *ast.CallExpr:
-			if sel, ok := x.Fun.(*ast.SelectorExpr); ok {
-				if isNamed(pass.TypesInfo.TypeOf(sel.X), pathBridgev2, "BridgeStateQueue") {
-					found = true
-					return false
-				}
-				name := strings.ToLower(sel.Sel.Name)
-				if strings.Contains(name, "bridgestate") || strings.Contains(name, "sendstate") || strings.Contains(name, "reconnect") {
-					found = true
-					return false
-				}
-			}
-			if depth > 0 {
-				if fd := pi.declOf(x); fd != nil && sendsState(pass, pi, fd.Body, depth-1, seen) {
-					found = true
-				}
-			}
-		}
-		return !found
-	})
-	return found
-}
-
-// checkLoggedOnly implements BS008.
-func checkLoggedOnly(pass *analysis.Pass, pi *pkgInfo, ef *errFlow) {
-	var targets []ast.Node
-	for fd := range pi.goTargets {
-		targets = append(targets, fd)
-	}
-	for _, lit := range pi.goLits {
-		targets = append(targets, lit)
-	}
-	for obj, fd := range pi.decls {
-		name := obj.Name()
-		if (strings.HasPrefix(name, "On") || strings.HasPrefix(name, "Handle") || strings.HasPrefix(name, "handle")) && strings.HasSuffix(name, "Error") {
-			targets = append(targets, fd)
-		}
-	}
-	sort.Slice(targets, func(i, j int) bool { return targets[i].Pos() < targets[j].Pos() })
-	reported := map[ast.Node]bool{}
-	for _, fn := range targets {
-		body := funcBody(fn)
-		if body == nil || reported[fn] || isTestFile(pass, fn) {
-			continue
-		}
-		isCallback := false
-		if fd, ok := fn.(*ast.FuncDecl); ok && strings.HasSuffix(fd.Name.Name, "Error") {
-			isCallback = true
-		}
-		var hit ast.Node
-		inspectFunc(body, func(n ast.Node) bool {
-			if hit != nil {
-				return false
-			}
-			ifs, ok := n.(*ast.IfStmt)
-			if !ok || !isErrNilCheck(pass, ifs.Cond) {
-				return true
-			}
-			if !isCallback && !insideRunLoop(pass, pi, ifs, fn) {
-				return true
-			}
-			if !onlyLogs(pass, ifs.Body) {
-				return true
-			}
-			// Only failures talking to the network count; a failed DB write in a loop isn't "dead but green".
-			if o := ef.classify(fn, ifs.Cond.(*ast.BinaryExpr).X, ifs.Body.Pos(), 1); o.kind == errRaw || (o.kind == errConstructed && o.callee != nil) {
-				hit = ifs
-			}
-			return true
-		})
-		if isCallback && hit == nil && onlyLogs(pass, body) {
-			hit = fn
-		}
-		if hit == nil || sendsState(pass, pi, body, 2, map[ast.Node]bool{}) {
-			continue
-		}
-		reported[fn] = true
-		report(pass, hit, BS008, "runtime failure is only logged and nothing in this goroutine sends a bridge state, so the login looks CONNECTED while it's broken; send TRANSIENT_DISCONNECT/UNKNOWN_ERROR and reconnect")
-	}
-}
-
 func isErrNilCheck(pass *analysis.Pass, cond ast.Expr) bool {
 	be, ok := cond.(*ast.BinaryExpr)
 	if !ok || be.Op != token.NEQ {
@@ -666,64 +568,6 @@ func isErrNilCheck(pass *analysis.Pass, cond ast.Expr) bool {
 	}
 	id, ok := be.Y.(*ast.Ident)
 	return ok && id.Name == "nil" && isErrorInterface(pass.TypesInfo.TypeOf(be.X))
-}
-
-// insideRunLoop reports whether n is inside a long-running loop: `for {}`, `for cond {}` or ranging over a channel.
-// Ranging over a slice or map is a batch, where skipping a failed item is normal.
-func insideRunLoop(pass *analysis.Pass, pi *pkgInfo, n ast.Node, fn ast.Node) bool {
-	for p := pi.parents[n]; p != nil && p != fn; p = pi.parents[p] {
-		switch x := p.(type) {
-		case *ast.ForStmt:
-			if x.Init == nil && x.Post == nil {
-				return true
-			}
-		case *ast.RangeStmt:
-			if t := pass.TypesInfo.TypeOf(x.X); t != nil {
-				if _, ok := t.Underlying().(*types.Chan); ok {
-					return true
-				}
-			}
-		case *ast.FuncLit:
-			return false
-		}
-	}
-	return false
-}
-
-// onlyLogs reports whether a block logs and then continues, returns nothing useful or sleeps.
-func onlyLogs(pass *analysis.Pass, block *ast.BlockStmt) bool {
-	if len(block.List) == 0 {
-		return false
-	}
-	logged := false
-	for _, s := range block.List {
-		switch x := s.(type) {
-		case *ast.ExprStmt:
-			call, ok := x.X.(*ast.CallExpr)
-			if !ok {
-				return false
-			}
-			if isLogCall(pass, call) {
-				logged = true
-				continue
-			}
-			if isPkgFunc(calleeObj(pass.TypesInfo, call), "time", "Sleep") {
-				continue
-			}
-			return false
-		case *ast.BranchStmt:
-			if x.Tok != token.CONTINUE && x.Tok != token.BREAK {
-				return false
-			}
-		case *ast.ReturnStmt:
-			if len(x.Results) > 0 {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return logged
 }
 
 // checkDisconnectEvents implements BS009.

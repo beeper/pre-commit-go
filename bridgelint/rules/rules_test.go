@@ -11,7 +11,28 @@ func TestMSS(t *testing.T) {
 }
 
 func TestBS(t *testing.T) {
+	MautrixVersion = "local"
+	defer func() { MautrixVersion = "" }()
 	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), BSAnalyzer, "bs")
+}
+
+func TestFrameworkHas(t *testing.T) {
+	cases := map[string]bool{
+		"":                                      false,
+		"local":                                 true,
+		"v0.32.0":                               false,
+		"v0.32.1":                               true,
+		"v0.33.0":                               true,
+		"v0.32.1-0.20261017155816-789c6d4faeb3": false,
+		"v0.32.1-0.20261019120000-0123456789ab": true,
+	}
+	for v, want := range cases {
+		MautrixVersion = v
+		if got := FrameworkHas(FeatureReloginDefault); got != want {
+			t.Errorf("FrameworkHas(relogin) with %q = %v, want %v", v, got, want)
+		}
+	}
+	MautrixVersion = ""
 }
 
 func TestLP(t *testing.T) {

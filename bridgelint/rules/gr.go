@@ -45,8 +45,11 @@ func runGR(pass *analysis.Pass) (any, error) {
 	if pi.isBridge {
 		checkSharedState(pass, pi)
 		checkCapabilitiesID(pass, pi)
-		checkGrowingMaps(pass, pi)
-		checkLogoutRemote(pass, pi)
+		if FrameworkHas(FeatureDisconnectAfterLogout) {
+			// Newer bridgev2 disconnects after LogoutRemote itself.
+		} else {
+			checkLogoutRemote(pass, pi)
+		}
 	}
 	return nil, nil
 }
@@ -168,18 +171,6 @@ func checkHTTPWithoutCtx(pass *analysis.Pass, f *ast.File) {
 			if obj := info.Uses[x.Sel]; isPkgFunc(obj, "net/http", "DefaultClient") {
 				report(pass, x, GR002, "http.DefaultClient has no timeout; use a client with Timeout set")
 			}
-		case *ast.CompositeLit:
-			if !isNamed(info.TypeOf(x), "net/http", "Client") {
-				return true
-			}
-			for _, elt := range x.Elts {
-				if kv, ok := elt.(*ast.KeyValueExpr); ok {
-					if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "Timeout" {
-						return true
-					}
-				}
-			}
-			report(pass, x, GR002, "http.Client without Timeout; a hung server blocks the caller forever (set Timeout, or suppress with a reason for streaming clients)")
 		}
 		return true
 	})
@@ -287,8 +278,6 @@ func checkExits(pass *analysis.Pass, pi *pkgInfo, f *ast.File) {
 				report(pass, call, GR004, fmt.Sprintf("log.%s in connector or library code kills the process; return an error instead", obj.Name()))
 			case obj != nil && (obj.Name() == "Fatal" || obj.Name() == "Panic") && recvType(obj) != nil && strings.Contains(recvType(obj).String(), "zerolog"):
 				report(pass, call, GR004, fmt.Sprintf("zerolog %s() exits or panics; log at Error and return an error instead", obj.Name()))
-			case obj == types.Universe.Lookup("panic"):
-				report(pass, call, GR004, "panic in connector or library code takes down every login on the process; return an error instead")
 			}
 			return true
 		})
@@ -409,7 +398,7 @@ func isMutableShared(t types.Type) bool {
 		return false
 	}
 	switch t.Underlying().(type) {
-	case *types.Map, *types.Slice, *types.Struct, *types.Pointer:
+	case *types.Map, *types.Slice:
 		return true
 	}
 	return false
@@ -446,65 +435,6 @@ func checkCapabilitiesID(pass *analysis.Pass, pi *pkgInfo) {
 		})
 		if mutation != nil && !idSet {
 			report(pass, mutation, GR011, fmt.Sprintf("GetCapabilities changes %s but keeps the same RoomFeatures.ID; clients cache features by ID, so give each variant its own ID", mutatedField))
-		}
-	}
-}
-
-// checkGrowingMaps implements GR012.
-func checkGrowingMaps(pass *analysis.Pass, pi *pkgInfo) {
-	info := pass.TypesInfo
-	inserts := map[*types.Var]ast.Node{}
-	shrinks := map[*types.Var]bool{}
-	fieldOf := func(e ast.Expr) *types.Var {
-		sel, ok := unparen(e).(*ast.SelectorExpr)
-		if !ok {
-			return nil
-		}
-		s, ok := info.Selections[sel]
-		if !ok || s.Kind() != types.FieldVal {
-			return nil
-		}
-		v := s.Obj().(*types.Var)
-		if v.Pkg() != pass.Pkg {
-			return nil
-		}
-		if _, ok := v.Type().Underlying().(*types.Map); !ok {
-			return nil
-		}
-		return v
-	}
-	for fobj, fd := range pi.decls {
-		if isTestFile(pass, fd) {
-			continue
-		}
-		isCtor := strings.HasPrefix(fobj.Name(), "New") || strings.HasPrefix(fobj.Name(), "new")
-		ast.Inspect(fd.Body, func(n ast.Node) bool {
-			switch x := n.(type) {
-			case *ast.AssignStmt:
-				for _, lhs := range x.Lhs {
-					if idx, ok := lhs.(*ast.IndexExpr); ok {
-						if v := fieldOf(idx.X); v != nil {
-							if _, seen := inserts[v]; !seen {
-								inserts[v] = x
-							}
-						}
-					} else if v := fieldOf(lhs); v != nil && !isCtor {
-						shrinks[v] = true
-					}
-				}
-			case *ast.CallExpr:
-				if obj := calleeObj(info, x); (obj == types.Universe.Lookup("delete") || obj == types.Universe.Lookup("clear")) && len(x.Args) > 0 {
-					if v := fieldOf(x.Args[0]); v != nil {
-						shrinks[v] = true
-					}
-				}
-			}
-			return true
-		})
-	}
-	for v, node := range inserts {
-		if !shrinks[v] {
-			report(pass, node, GR012, fmt.Sprintf("map field %s is only ever inserted into; delete entries or cap it so it can't grow for the lifetime of the login", v.Name()))
 		}
 	}
 }
