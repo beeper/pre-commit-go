@@ -1,0 +1,794 @@
+package rules
+
+import (
+	"fmt"
+	"go/ast"
+	"go/token"
+	"go/types"
+	"os"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+
+	"golang.org/x/tools/go/analysis"
+)
+
+// ModuleHumanErrorKeys holds human-error codes registered anywhere in the packages being linted.
+// The driver fills it before analysis so a code registered in one package counts in another.
+var ModuleHumanErrorKeys = map[string]bool{}
+
+var BSAnalyzer = &analysis.Analyzer{
+	Name: "bs",
+	Doc:  "bridge state rules (BS001-BS011): states must carry the right event, action, code and human message, and failures must not be silent",
+	Run:  runBS,
+}
+
+var (
+	restrictionRegex    = regexp.MustCompile(`(?i)ban|banned|suspend|restrict|lock|checkpoint|consent|challenge|disabled|deactivat|access.?denied|not.?offered`)
+	restrictionFixRegex = regexp.MustCompile(`(?i)ban|suspend|restrict|locked|checkpoint`)
+	eventTypeNameRegex  = regexp.MustCompile(`(Event|Create|Update|Delete|Ready|Connect|Disconnect)$`)
+	authCondRegex       = regexp.MustCompile(`(?i)\b40[13]\b|StatusUnauthorized|StatusForbidden|Unauthori[sz]ed|Forbidden|AuthError|InvalidAuth|BadCredentials`)
+)
+
+type stateLit struct {
+	lit     *ast.CompositeLit
+	qual    string
+	fn      ast.Node
+	fields  map[string]ast.Expr
+	event   string
+	code    string
+	hasCode bool
+	codeOK  bool // code is a constant
+	action  string
+}
+
+func runBS(pass *analysis.Pass) (any, error) {
+	pi := infoFor(pass)
+	keys := CollectHumanErrorKeys(pass.TypesInfo, pass.Files)
+	for k := range ModuleHumanErrorKeys {
+		keys[k] = true
+	}
+	if !pi.isBridge {
+		return nil, nil
+	}
+	cfg := ConfigFor(pass)
+	ef := newErrFlow(pi, cfg)
+	codeShape := regexp.MustCompile(`^` + regexp.QuoteMeta(cfg.ErrorPrefix) + `-[a-z0-9-]+$`)
+
+	for _, sl := range collectStateLits(pass, pi) {
+		checkStateLit(pass, pi, ef, cfg, sl, keys, codeShape)
+	}
+	checkLoggedOnly(pass, pi, ef)
+	checkDisconnectEvents(pass, cfg)
+	return nil, nil
+}
+
+// CollectHumanErrorKeys returns the codes registered in status.BridgeStateErrorMap literals and assignments.
+func CollectHumanErrorKeys(info *types.Info, files []*ast.File) map[string]bool {
+	keys := map[string]bool{}
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.CompositeLit:
+				if isNamed(info.TypeOf(x), pathStatus, "BridgeStateErrorMap") {
+					for _, elt := range x.Elts {
+						if kv, ok := elt.(*ast.KeyValueExpr); ok {
+							if s, ok := constString(info, kv.Key); ok {
+								keys[s] = true
+							}
+						}
+					}
+				}
+			case *ast.AssignStmt:
+				for _, lhs := range x.Lhs {
+					if idx, ok := lhs.(*ast.IndexExpr); ok && isNamed(info.TypeOf(idx.X), pathStatus, "BridgeStateErrorMap") {
+						if s, ok := constString(info, idx.Index); ok {
+							keys[s] = true
+						}
+					}
+				}
+			}
+			return true
+		})
+	}
+	return keys
+}
+
+func collectStateLits(pass *analysis.Pass, pi *pkgInfo) []*stateLit {
+	var out []*stateLit
+	info := pass.TypesInfo
+	for _, f := range pass.Files {
+		if isTestFile(pass, f) {
+			continue
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			lit, ok := n.(*ast.CompositeLit)
+			if !ok || !isNamed(info.TypeOf(lit), pathStatus, "BridgeState") {
+				return true
+			}
+			if _, isPtr := info.TypeOf(lit).(*types.Pointer); isPtr {
+				return true
+			}
+			sl := &stateLit{lit: lit, fn: pi.enclosingFunc(lit), fields: map[string]ast.Expr{}, qual: "status"}
+			if sel, ok := lit.Type.(*ast.SelectorExpr); ok {
+				if id, ok := sel.X.(*ast.Ident); ok {
+					sl.qual = id.Name
+				}
+			}
+			for _, elt := range lit.Elts {
+				if kv, ok := elt.(*ast.KeyValueExpr); ok {
+					if key, ok := kv.Key.(*ast.Ident); ok {
+						sl.fields[key.Name] = kv.Value
+					}
+				}
+			}
+			mergeLaterAssignments(pass, pi, sl)
+			if e, ok := sl.fields["StateEvent"]; ok {
+				sl.event, _ = constString(info, e)
+			}
+			if e, ok := sl.fields["Error"]; ok {
+				sl.hasCode = true
+				sl.code, sl.codeOK = constString(info, e)
+			}
+			if e, ok := sl.fields["UserAction"]; ok {
+				sl.action, _ = constString(info, e)
+			}
+			out = append(out, sl)
+			return true
+		})
+	}
+	return out
+}
+
+// mergeLaterAssignments folds `state.Field = x` assignments in the same function into the literal's fields.
+func mergeLaterAssignments(pass *analysis.Pass, pi *pkgInfo, sl *stateLit) {
+	var v types.Object
+	switch p := pi.parents[sl.lit].(type) {
+	case *ast.AssignStmt:
+		for i, rhs := range p.Rhs {
+			if rhs == sl.lit && i < len(p.Lhs) {
+				if id, ok := p.Lhs[i].(*ast.Ident); ok {
+					v = pass.TypesInfo.ObjectOf(id)
+				}
+			}
+		}
+	case *ast.ValueSpec:
+		for i, val := range p.Values {
+			if val == sl.lit && i < len(p.Names) {
+				v = pass.TypesInfo.ObjectOf(p.Names[i])
+			}
+		}
+	}
+	if v == nil || sl.fn == nil {
+		return
+	}
+	inspectFunc(funcBody(sl.fn), func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for i, lhs := range as.Lhs {
+			sel, ok := lhs.(*ast.SelectorExpr)
+			if !ok || i >= len(as.Rhs) {
+				continue
+			}
+			if id, ok := sel.X.(*ast.Ident); ok && pass.TypesInfo.ObjectOf(id) == v {
+				sl.fields[sel.Sel.Name] = as.Rhs[i]
+			}
+		}
+		return true
+	})
+}
+
+func checkStateLit(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, sl *stateLit, keys map[string]bool, codeShape *regexp.Regexp) {
+	info := pass.TypesInfo
+	lit := sl.lit
+	isErrorState := sl.event != "" && !slices.Contains([]string{"CONNECTED", "CONNECTING", "BACKFILLING", "STARTING", "RUNNING", "UNCONFIGURED"}, sl.event)
+
+	// BS001
+	if sl.event == "BAD_CREDENTIALS" && sl.action == "RELOGIN" {
+		report(pass, sl.fields["UserAction"], BS001, "BAD_CREDENTIALS already defaults to RELOGIN in bridgev2; the explicit UserAction is redundant")
+	}
+
+	// BS002
+	if sl.codeOK && restrictionRegex.MatchString(sl.code) && !(sl.event == "BAD_CREDENTIALS" && sl.action == "OPEN_NATIVE") && sl.event != "" {
+		msg := fmt.Sprintf("%q looks like a restriction or ban but is sent as %s", sl.code, describeState(sl))
+		var opts []reportOpt
+		if sl.event == "BAD_CREDENTIALS" && (sl.action == "RESTART" || restrictionFixRegex.MatchString(sl.code)) {
+			opts = append(opts, userActionFix(pass, sl))
+		}
+		report(pass, lit, BS002, msg+"; restrictions are BAD_CREDENTIALS with UserAction OPEN_NATIVE", opts...)
+	} else if sl.event == "BAD_CREDENTIALS" && sl.action == "RESTART" {
+		report(pass, sl.fields["UserAction"], BS002, "UserActionRestart with BAD_CREDENTIALS; use OPEN_NATIVE for problems the user fixes on the network, or leave it unset for RELOGIN", userActionFix(pass, sl))
+	}
+
+	// BS003
+	if msg, ok := sl.fields["Message"]; ok && exprShowsError(info, msg) {
+		var opts []reportOpt
+		note := "move the raw error to Info[\"go_error\"] and write a human message"
+		if sl.codeOK && keys[sl.code] {
+			opts = append(opts, withSeverity(SeverityWarning))
+			note = "the human-error map replaces it, so it's silently discarded; move it to Info[\"go_error\"]"
+		}
+		report(pass, msg, BS003, "bridge state Message is built from raw error text; "+note, opts...)
+	}
+
+	// BS004
+	if isErrorState {
+		switch {
+		case !sl.hasCode:
+			report(pass, lit, BS004, fmt.Sprintf("%s state has no Error code; give it a stable <net>-<reason> code", sl.event))
+		case sl.codeOK && sl.code == "":
+			report(pass, lit, BS004, fmt.Sprintf("%s state has an empty Error code", sl.event))
+		case sl.codeOK && cfg.ErrorPrefix != "" && !codeShape.MatchString(sl.code):
+			report(pass, sl.fields["Error"], BS004, fmt.Sprintf("code %q doesn't match %s-<reason>", sl.code, cfg.ErrorPrefix))
+		case !sl.codeOK:
+			if format, ok := sprintfFormat(info, sl.fields["Error"]); ok && !slices.Contains(cfg.CodeFormatAllowlist, format) {
+				report(pass, sl.fields["Error"], BS004, fmt.Sprintf("code built with fmt.Sprintf(%q); codes must come from a bounded set (add the format to code_format_allowlist if it is)", format))
+			}
+		}
+	}
+
+	// BS005
+	if isErrorState && sl.codeOK && sl.code != "" && !keys[sl.code] {
+		if msg, ok := sl.fields["Message"]; !ok || isEmptyString(info, msg) {
+			report(pass, lit, BS005, fmt.Sprintf("code %q has no Message and no status.BridgeStateHumanErrors entry", sl.code))
+		}
+	}
+
+	if sl.fn == nil {
+		return
+	}
+
+	// BS006
+	if sl.event == "UNKNOWN_ERROR" {
+		if ifs, errExpr := enclosingErrCheck(pass, pi, lit); ifs != nil {
+			o := ef.classify(sl.fn, errExpr, ifs.Body.Pos(), 1)
+			if o.kind == errRaw && !classifiesErrors(pass, funcBody(sl.fn)) {
+				report(pass, lit, BS006, fmt.Sprintf("UNKNOWN_ERROR for an unclassified %s; check for rate limits, 5xx, timeouts and network errors first and send TRANSIENT_DISCONNECT (with a retry) for those", describeOrigin(pass.Fset, o)))
+			}
+		}
+	}
+
+	// BS007
+	if sl.event == "TRANSIENT_DISCONNECT" && isLifecycle(pi, sl.fn) {
+		if next := nextStmtAfter(pi, lit); next != nil && exitsFunctionOrLoop(next) && !hasRetrySignal(pass, funcBody(sl.fn)) {
+			report(pass, lit, BS007, "TRANSIENT_DISCONNECT followed by giving up, with nothing scheduling a reconnect; the login stays disconnected until a restart. Retry with backoff, or send UNKNOWN_ERROR so the framework reconnects")
+		}
+	}
+
+	// BS010
+	if sl.event == "TRANSIENT_DISCONNECT" {
+		if cond := enclosingCondText(pass, pi, lit); authCondRegex.MatchString(cond) {
+			report(pass, lit, BS010, "TRANSIENT_DISCONNECT under an auth check; a rejected session won't recover by waiting, send BAD_CREDENTIALS")
+		}
+	}
+
+	// BS011
+	if sl.event == "BAD_CREDENTIALS" && isCatchAllAuth(pass, pi, ef, sl) {
+		report(pass, lit, BS011, "BAD_CREDENTIALS sent for every connect error; only send it for errors that mean the session is invalid")
+	}
+}
+
+func describeState(sl *stateLit) string {
+	if sl.action != "" {
+		return sl.event + " with " + sl.action
+	}
+	return sl.event + " with no UserAction"
+}
+
+func userActionFix(pass *analysis.Pass, sl *stateLit) reportOpt {
+	value := sl.qual + ".UserActionOpenNative"
+	if existing, ok := sl.fields["UserAction"]; ok {
+		if containsNode(sl.lit, existing) {
+			return withFix("Use UserActionOpenNative", analysis.TextEdit{Pos: existing.Pos(), End: existing.End(), NewText: []byte(value)})
+		}
+		return func(*analysis.Diagnostic, *Severity) {}
+	}
+	lit := sl.lit
+	if len(lit.Elts) == 0 {
+		return withFix("Add UserActionOpenNative", analysis.TextEdit{Pos: lit.Rbrace, End: lit.Rbrace, NewText: []byte("UserAction: " + value)})
+	}
+	last := lit.Elts[len(lit.Elts)-1]
+	if pass.Fset.Position(lit.Rbrace).Line == pass.Fset.Position(last.End()).Line {
+		return withFix("Add UserActionOpenNative", analysis.TextEdit{Pos: last.End(), End: last.End(), NewText: []byte(", UserAction: " + value)})
+	}
+	indent := lineIndent(pass, last.Pos())
+	rbraceIndent := lineIndent(pass, lit.Rbrace)
+	return withFix("Add UserActionOpenNative", analysis.TextEdit{
+		Pos:     lit.Rbrace,
+		End:     lit.Rbrace,
+		NewText: []byte(strings.TrimPrefix(indent, rbraceIndent) + "UserAction: " + value + ",\n" + rbraceIndent),
+	})
+}
+
+func containsNode(outer, inner ast.Node) bool {
+	return inner.Pos() >= outer.Pos() && inner.End() <= outer.End()
+}
+
+func lineIndent(pass *analysis.Pass, pos token.Pos) string {
+	p := pass.Fset.Position(pos)
+	data, err := readFile(pass, p.Filename)
+	if err != nil {
+		return ""
+	}
+	start := p.Offset - (p.Column - 1)
+	if start < 0 || p.Offset > len(data) {
+		return ""
+	}
+	line := data[start:p.Offset]
+	return string(line[:len(line)-len(strings.TrimLeft(string(line), " \t"))])
+}
+
+func readFile(pass *analysis.Pass, name string) ([]byte, error) {
+	if pass.ReadFile != nil {
+		return pass.ReadFile(name)
+	}
+	return os.ReadFile(name)
+}
+
+func sprintfFormat(info *types.Info, e ast.Expr) (string, bool) {
+	e = unparen(e)
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return "", false
+	}
+	if tv, ok := info.Types[call.Fun]; ok && tv.IsType() && len(call.Args) == 1 {
+		return sprintfFormat(info, call.Args[0])
+	}
+	if !isPkgFunc(calleeObj(info, call), "fmt", "Sprintf") {
+		return "", false
+	}
+	format, ok := stringArg(info, call, 0)
+	if !ok {
+		return "<dynamic>", true
+	}
+	return format, true
+}
+
+func isEmptyString(info *types.Info, e ast.Expr) bool {
+	s, ok := constString(info, e)
+	return ok && s == ""
+}
+
+// enclosingErrCheck finds the innermost `if err != nil` whose body contains n.
+func enclosingErrCheck(pass *analysis.Pass, pi *pkgInfo, n ast.Node) (*ast.IfStmt, ast.Expr) {
+	for p := pi.parents[n]; p != nil; p = pi.parents[p] {
+		switch x := p.(type) {
+		case *ast.FuncDecl, *ast.FuncLit:
+			return nil, nil
+		case *ast.IfStmt:
+			if !containsNode(x.Body, n) {
+				continue
+			}
+			if be, ok := x.Cond.(*ast.BinaryExpr); ok && be.Op == token.NEQ {
+				if id, ok := be.Y.(*ast.Ident); ok && id.Name == "nil" && isErrorInterface(pass.TypesInfo.TypeOf(be.X)) {
+					return x, be.X
+				}
+			}
+		}
+	}
+	return nil, nil
+}
+
+func classifiesErrors(pass *analysis.Pass, body ast.Node) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.CallExpr:
+			obj := calleeObj(pass.TypesInfo, x)
+			if isPkgFunc(obj, "errors", "As", "AsType") || isPkgFunc(obj, "os", "IsTimeout") {
+				found = true
+			}
+			if sel, ok := x.Fun.(*ast.SelectorExpr); ok && (sel.Sel.Name == "Timeout" || sel.Sel.Name == "Temporary") {
+				found = true
+			}
+		case *ast.SelectorExpr:
+			name := x.Sel.Name
+			if name == "StatusCode" || name == "DeadlineExceeded" || strings.Contains(name, "RateLimit") || strings.Contains(name, "Timeout") {
+				found = true
+			}
+		case *ast.Ident:
+			if strings.Contains(x.Name, "RateLimit") || strings.Contains(x.Name, "rateLimit") {
+				found = true
+			}
+		case *ast.TypeAssertExpr:
+			if isNamed(pass.TypesInfo.TypeOf(x.Type), "net", "Error") {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+func isLifecycle(pi *pkgInfo, fn ast.Node) bool {
+	switch f := fn.(type) {
+	case *ast.FuncDecl:
+		return pi.scopes[f]&ScopeLifecycle != 0 || pi.goTargets[f]
+	case *ast.FuncLit:
+		return slices.Contains(pi.goLits, f)
+	}
+	return false
+}
+
+// nextStmtAfter returns the statement following the one that contains n, in the same block.
+func nextStmtAfter(pi *pkgInfo, n ast.Node) ast.Stmt {
+	var child ast.Node = n
+	for p := pi.parents[n]; p != nil; child, p = p, pi.parents[p] {
+		switch x := p.(type) {
+		case *ast.FuncDecl, *ast.FuncLit:
+			return nil
+		case *ast.BlockStmt:
+			for i, s := range x.List {
+				if s == child && i+1 < len(x.List) {
+					return x.List[i+1]
+				}
+			}
+			return nil
+		case *ast.CaseClause:
+			for i, s := range x.Body {
+				if s == child && i+1 < len(x.Body) {
+					return x.Body[i+1]
+				}
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+func exitsFunctionOrLoop(s ast.Stmt) bool {
+	switch x := s.(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.BranchStmt:
+		return x.Tok == token.BREAK || x.Tok == token.GOTO
+	}
+	return false
+}
+
+var retryNameRegex = regexp.MustCompile(`(?i)reconnect|retry|backoff|restart`)
+
+func hasRetrySignal(pass *analysis.Pass, body ast.Node) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return !found
+		}
+		obj := calleeObj(pass.TypesInfo, call)
+		if isPkgFunc(obj, "time", "AfterFunc") {
+			found = true
+		}
+		if obj != nil && retryNameRegex.MatchString(obj.Name()) {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+func enclosingCondText(pass *analysis.Pass, pi *pkgInfo, n ast.Node) string {
+	var parts []string
+	for p := pi.parents[n]; p != nil; p = pi.parents[p] {
+		switch x := p.(type) {
+		case *ast.FuncDecl, *ast.FuncLit:
+			return strings.Join(parts, " ")
+		case *ast.IfStmt:
+			if containsNode(x.Body, n) {
+				parts = append(parts, nodeText(pass, x.Cond))
+			}
+		case *ast.CaseClause:
+			for _, e := range x.List {
+				parts = append(parts, nodeText(pass, e))
+			}
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func nodeText(pass *analysis.Pass, n ast.Node) string {
+	start := pass.Fset.Position(n.Pos())
+	end := pass.Fset.Position(n.End())
+	data, err := readFile(pass, start.Filename)
+	if err != nil || end.Offset > len(data) || start.Offset > end.Offset {
+		return ""
+	}
+	return string(data[start.Offset:end.Offset])
+}
+
+// isCatchAllAuth reports BAD_CREDENTIALS in a default/else branch, or directly under `if err != nil` after a connect call.
+func isCatchAllAuth(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, sl *stateLit) bool {
+	var child ast.Node = sl.lit
+	for p := pi.parents[sl.lit]; p != nil; child, p = p, pi.parents[p] {
+		switch x := p.(type) {
+		case *ast.FuncDecl, *ast.FuncLit:
+			return false
+		case *ast.CaseClause:
+			if x.List != nil {
+				return false
+			}
+			sw, ok := pi.parents[pi.parents[x]].(*ast.SwitchStmt)
+			if !ok {
+				return false
+			}
+			mentionsErr := false
+			ast.Inspect(sw.Body, func(n ast.Node) bool {
+				if cc, ok := n.(*ast.CaseClause); ok {
+					for _, e := range cc.List {
+						if isErrorType(pass.TypesInfo.TypeOf(e)) || strings.Contains(nodeText(pass, e), "errors.Is") {
+							mentionsErr = true
+						}
+					}
+				}
+				return !mentionsErr
+			})
+			return mentionsErr
+		case *ast.IfStmt:
+			if x.Else == child {
+				cond := nodeText(pass, x.Cond)
+				_, isBlock := x.Else.(*ast.BlockStmt)
+				return isBlock && strings.Contains(cond, "err") && !authCondRegex.MatchString(cond)
+			}
+			if containsNode(x.Body, sl.lit) {
+				if be, ok := x.Cond.(*ast.BinaryExpr); ok && be.Op == token.NEQ && isErrorInterface(pass.TypesInfo.TypeOf(be.X)) {
+					o := ef.classify(sl.fn, be.X, x.Body.Pos(), 0)
+					if o.kind == errRaw && o.callee != nil && strings.Contains(o.callee.Name(), "Connect") {
+						return true
+					}
+				}
+				return false
+			}
+		}
+	}
+	return false
+}
+
+var logMethodNames = map[string]bool{"Msg": true, "Msgf": true, "Printf": true, "Println": true, "Print": true}
+
+func isLogCall(pass *analysis.Pass, call *ast.CallExpr) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || !logMethodNames[sel.Sel.Name] {
+		return false
+	}
+	if sel.Sel.Name == "Msg" || sel.Sel.Name == "Msgf" {
+		return true
+	}
+	t := pass.TypesInfo.TypeOf(sel.X)
+	if t == nil {
+		return isPkgFunc(calleeObj(pass.TypesInfo, call), "log")
+	}
+	return strings.Contains(strings.ToLower(t.String()), "log")
+}
+
+func sendsState(pass *analysis.Pass, pi *pkgInfo, body ast.Node, depth int, seen map[ast.Node]bool) bool {
+	if body == nil || seen[body] {
+		return false
+	}
+	seen[body] = true
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.CompositeLit:
+			if isNamed(pass.TypesInfo.TypeOf(x), pathStatus, "BridgeState") {
+				found = true
+			}
+		case *ast.CallExpr:
+			if sel, ok := x.Fun.(*ast.SelectorExpr); ok {
+				if isNamed(pass.TypesInfo.TypeOf(sel.X), pathBridgev2, "BridgeStateQueue") {
+					found = true
+					return false
+				}
+				name := strings.ToLower(sel.Sel.Name)
+				if strings.Contains(name, "bridgestate") || strings.Contains(name, "sendstate") || strings.Contains(name, "reconnect") {
+					found = true
+					return false
+				}
+			}
+			if depth > 0 {
+				if fd := pi.declOf(x); fd != nil && sendsState(pass, pi, fd.Body, depth-1, seen) {
+					found = true
+				}
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// checkLoggedOnly implements BS008.
+func checkLoggedOnly(pass *analysis.Pass, pi *pkgInfo, ef *errFlow) {
+	var targets []ast.Node
+	for fd := range pi.goTargets {
+		targets = append(targets, fd)
+	}
+	for _, lit := range pi.goLits {
+		targets = append(targets, lit)
+	}
+	for obj, fd := range pi.decls {
+		name := obj.Name()
+		if (strings.HasPrefix(name, "On") || strings.HasPrefix(name, "Handle") || strings.HasPrefix(name, "handle")) && strings.HasSuffix(name, "Error") {
+			targets = append(targets, fd)
+		}
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].Pos() < targets[j].Pos() })
+	reported := map[ast.Node]bool{}
+	for _, fn := range targets {
+		body := funcBody(fn)
+		if body == nil || reported[fn] || isTestFile(pass, fn) {
+			continue
+		}
+		isCallback := false
+		if fd, ok := fn.(*ast.FuncDecl); ok && strings.HasSuffix(fd.Name.Name, "Error") {
+			isCallback = true
+		}
+		var hit ast.Node
+		inspectFunc(body, func(n ast.Node) bool {
+			if hit != nil {
+				return false
+			}
+			ifs, ok := n.(*ast.IfStmt)
+			if !ok || !isErrNilCheck(pass, ifs.Cond) {
+				return true
+			}
+			if !isCallback && !insideRunLoop(pass, pi, ifs, fn) {
+				return true
+			}
+			if !onlyLogs(pass, ifs.Body) {
+				return true
+			}
+			// Only failures talking to the network count; a failed DB write in a loop isn't "dead but green".
+			if o := ef.classify(fn, ifs.Cond.(*ast.BinaryExpr).X, ifs.Body.Pos(), 1); o.kind == errRaw || (o.kind == errConstructed && o.callee != nil) {
+				hit = ifs
+			}
+			return true
+		})
+		if isCallback && hit == nil && onlyLogs(pass, body) {
+			hit = fn
+		}
+		if hit == nil || sendsState(pass, pi, body, 2, map[ast.Node]bool{}) {
+			continue
+		}
+		reported[fn] = true
+		report(pass, hit, BS008, "runtime failure is only logged and nothing in this goroutine sends a bridge state, so the login looks CONNECTED while it's broken; send TRANSIENT_DISCONNECT/UNKNOWN_ERROR and reconnect")
+	}
+}
+
+func isErrNilCheck(pass *analysis.Pass, cond ast.Expr) bool {
+	be, ok := cond.(*ast.BinaryExpr)
+	if !ok || be.Op != token.NEQ {
+		return false
+	}
+	id, ok := be.Y.(*ast.Ident)
+	return ok && id.Name == "nil" && isErrorInterface(pass.TypesInfo.TypeOf(be.X))
+}
+
+// insideRunLoop reports whether n is inside a long-running loop: `for {}`, `for cond {}` or ranging over a channel.
+// Ranging over a slice or map is a batch, where skipping a failed item is normal.
+func insideRunLoop(pass *analysis.Pass, pi *pkgInfo, n ast.Node, fn ast.Node) bool {
+	for p := pi.parents[n]; p != nil && p != fn; p = pi.parents[p] {
+		switch x := p.(type) {
+		case *ast.ForStmt:
+			if x.Init == nil && x.Post == nil {
+				return true
+			}
+		case *ast.RangeStmt:
+			if t := pass.TypesInfo.TypeOf(x.X); t != nil {
+				if _, ok := t.Underlying().(*types.Chan); ok {
+					return true
+				}
+			}
+		case *ast.FuncLit:
+			return false
+		}
+	}
+	return false
+}
+
+// onlyLogs reports whether a block logs and then continues, returns nothing useful or sleeps.
+func onlyLogs(pass *analysis.Pass, block *ast.BlockStmt) bool {
+	if len(block.List) == 0 {
+		return false
+	}
+	logged := false
+	for _, s := range block.List {
+		switch x := s.(type) {
+		case *ast.ExprStmt:
+			call, ok := x.X.(*ast.CallExpr)
+			if !ok {
+				return false
+			}
+			if isLogCall(pass, call) {
+				logged = true
+				continue
+			}
+			if isPkgFunc(calleeObj(pass.TypesInfo, call), "time", "Sleep") {
+				continue
+			}
+			return false
+		case *ast.BranchStmt:
+			if x.Tok != token.CONTINUE && x.Tok != token.BREAK {
+				return false
+			}
+		case *ast.ReturnStmt:
+			if len(x.Results) > 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return logged
+}
+
+// checkDisconnectEvents implements BS009.
+func checkDisconnectEvents(pass *analysis.Pass, cfg *Config) {
+	for path, wanted := range cfg.DisconnectEvents {
+		var lib *types.Package
+		for _, imp := range pass.Pkg.Imports() {
+			if imp.Path() == path {
+				lib = imp
+			}
+		}
+		if lib == nil {
+			continue
+		}
+		var switches []*ast.TypeSwitchStmt
+		covered := map[string]bool{}
+		for _, f := range pass.Files {
+			ast.Inspect(f, func(n ast.Node) bool {
+				ts, ok := n.(*ast.TypeSwitchStmt)
+				if !ok {
+					return true
+				}
+				fromLib := false
+				for _, s := range ts.Body.List {
+					cc := s.(*ast.CaseClause)
+					for _, e := range cc.List {
+						t := pass.TypesInfo.TypeOf(e)
+						name := typeNameIn(t, lib)
+						if name != "" {
+							covered[name] = true
+							if eventTypeNameRegex.MatchString(name) || slices.Contains(wanted, name) {
+								fromLib = true
+							}
+						}
+					}
+				}
+				if fromLib {
+					switches = append(switches, ts)
+				}
+				return true
+			})
+		}
+		if len(switches) == 0 {
+			continue
+		}
+		for _, w := range wanted {
+			if !covered[w] {
+				report(pass, switches[0], BS009, fmt.Sprintf("event handler for %s has no case for %s; a dropped connection goes unnoticed", lib.Name(), w))
+			}
+		}
+	}
+}
+
+func typeNameIn(t types.Type, pkg *types.Package) string {
+	if t == nil {
+		return ""
+	}
+	prefix := ""
+	if p, ok := t.(*types.Pointer); ok {
+		prefix = "*"
+		t = p.Elem()
+	}
+	n, ok := types.Unalias(t).(*types.Named)
+	if !ok || n.Obj().Pkg() != pkg {
+		return ""
+	}
+	return prefix + n.Obj().Name()
+}

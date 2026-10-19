@@ -1,0 +1,14 @@
+// Package epnetlib is a protocol library (it doesn't import bridgev2).
+package epnetlib
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func check(resp *http.Response) error {
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("unexpected status code %d", resp.StatusCode) // want `EP002: HTTP status formatted into a plain error`
+	}
+	return nil
+}
