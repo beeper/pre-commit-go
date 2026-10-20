@@ -113,3 +113,24 @@ func (logger) Err(err error) *logEvent { return &logEvent{} }
 func (*logEvent) Msg(msg string)       {}
 
 var zlog logger
+
+type GuardedLogin struct{ client *netlib.Client }
+
+var _ bridgev2.LoginProcess = (*GuardedLogin)(nil)
+
+func (g *GuardedLogin) Cancel() {}
+func (g *GuardedLogin) Start(ctx context.Context) (step *bridgev2.LoginStep, err error) {
+	defer func() {
+		if errors.Is(err, netlib.ErrRateLimited) {
+			err = ErrRateLimitedOK
+		}
+	}()
+	if err := g.client.Connect(ctx); errors.Is(err, ErrInvalidToken) {
+		return nil, err
+	}
+	var respErr bridgev2.RespError
+	if err := g.client.Connect(ctx); errors.As(err, &respErr) {
+		return nil, err
+	}
+	return nil, netlib.ErrRateLimited
+}

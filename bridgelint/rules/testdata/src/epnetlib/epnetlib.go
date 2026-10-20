@@ -12,3 +12,12 @@ func check(resp *http.Response) error {
 	}
 	return nil
 }
+
+type reply struct{ Status int }
+
+func checkReply(r reply) error {
+	if r.Status != 0 {
+		return fmt.Errorf("server returned status %d", r.Status)
+	}
+	return nil
+}

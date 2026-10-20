@@ -187,7 +187,7 @@ phone, for example) asks for retries deliberately and isn't reported.
 | Rule | Severity | Flags |
 |---|---|---|
 | EP001 | error | Errors matched by exact string: `err.Error() == "..."`, `switch err.Error()`, `strings.EqualFold(err.Error(), ...)`. Comparisons with `""` and substring matches aren't flagged, since some servers only give text. |
-| EP002 | warning | In library packages (ones that don't import bridgev2), an HTTP status formatted into a plain error, so callers can't tell 429 from 403 from 5xx. |
+| EP002 | warning | In library packages (ones that don't import bridgev2), an `http.Response` status formatted into a plain error, so callers can't tell 429 from 403 from 5xx. |
 | EP003 | info | `errors.Join` returned from a Matrix handler or used as a user-facing message. |
 
 ### General reliability (GR)

@@ -114,7 +114,14 @@ func (ef *errFlow) originOfReturn(fn ast.Node, ret *ast.ReturnStmt, idx, depth i
 	}
 	switch {
 	case len(ret.Results) == sig.Results().Len() && idx < len(ret.Results):
-		return ef.classify(fn, ret.Results[idx], ret.Pos(), depth)
+		if ef.guardedByStatusIs(fn, ret, ret.Results[idx]) {
+			return errOrigin{kind: errGood}
+		}
+		o := ef.classify(fn, ret.Results[idx], ret.Pos(), depth)
+		if v, ok := o.callee.(*types.Var); ok && o.bad() && ef.deferMapsSentinel(fn, sig, idx, v) {
+			return errOrigin{kind: errGood}
+		}
+		return o
 	case len(ret.Results) == 1:
 		if call, ok := unparen(ret.Results[0]).(*ast.CallExpr); ok {
 			return ef.classifyCall(fn, call, idx, depth)
@@ -171,6 +178,110 @@ func (ef *errFlow) rewrittenByDefer(fn ast.Node, sig *types.Signature, idx int) 
 				}
 				if ef.onlyUnderNilCheck(as, lit, result) {
 					found = true
+				}
+			}
+			return !found
+		})
+		return !found
+	})
+	return found
+}
+
+// guardedByStatusIs reports whether ret returns a local error inside `if errors.Is(err, S)`, where S is
+// a message status or RespError, or inside `if errors.As(err, &target)` with a target of one of those
+// types: the returned error contains the status, so the caller gets it.
+func (ef *errFlow) guardedByStatusIs(fn ast.Node, ret *ast.ReturnStmt, e ast.Expr) bool {
+	id, ok := unparen(e).(*ast.Ident)
+	if !ok {
+		return false
+	}
+	v := ef.info.Uses[id]
+	if v == nil {
+		return false
+	}
+	var prev ast.Node = ret
+	for p := ef.pi.parents[ret]; p != nil && p != fn; prev, p = p, ef.pi.parents[p] {
+		ifs, ok := p.(*ast.IfStmt)
+		if !ok || prev != ifs.Body {
+			continue
+		}
+		if ef.condIsStatus(ifs.Cond, v, ef.isStatusTarget) {
+			return true
+		}
+	}
+	return false
+}
+
+// isStatusTarget matches the second argument of errors.Is (a status value) or errors.As (a pointer to
+// a status variable).
+func (ef *errFlow) isStatusTarget(arg ast.Expr) bool {
+	if u, ok := unparen(arg).(*ast.UnaryExpr); ok && u.Op == token.AND {
+		t := ef.info.TypeOf(u.X)
+		if ptr, ok := t.(*types.Pointer); ok {
+			t = ptr.Elem()
+		}
+		return t != nil && (isNamed(t, pathBridgev2, "MessageStatus") || isRespErrorType(t))
+	}
+	return ef.isStatusExpr(arg)
+}
+
+// condIsStatus reports whether cond is (or is a && conjunct of) errors.Is(v, S) with match(S).
+func (ef *errFlow) condIsStatus(cond ast.Expr, v types.Object, match func(ast.Expr) bool) bool {
+	cond = unparen(cond)
+	if be, ok := cond.(*ast.BinaryExpr); ok && be.Op == token.LAND {
+		return ef.condIsStatus(be.X, v, match) || ef.condIsStatus(be.Y, v, match)
+	}
+	call, ok := cond.(*ast.CallExpr)
+	if !ok || len(call.Args) != 2 || !isPkgFunc(calleeObj(ef.info, call), "errors", "Is", "As") {
+		return false
+	}
+	id, ok := unparen(call.Args[0]).(*ast.Ident)
+	return ok && ef.info.Uses[id] == v && match(call.Args[1])
+}
+
+// deferMapsSentinel reports whether a deferred closure in fn replaces the named error result with a
+// status when it matches the sentinel v: `if errors.Is(err, v) { err = <status> }`.
+func (ef *errFlow) deferMapsSentinel(fn ast.Node, sig *types.Signature, idx int, v *types.Var) bool {
+	if idx < 0 || idx >= sig.Results().Len() || sig.Results().At(idx).Name() == "" {
+		return false
+	}
+	result := sig.Results().At(idx)
+	isSentinel := func(e ast.Expr) bool {
+		var id *ast.Ident
+		switch x := unparen(e).(type) {
+		case *ast.Ident:
+			id = x
+		case *ast.SelectorExpr:
+			id = x.Sel
+		default:
+			return false
+		}
+		return ef.info.Uses[id] == v
+	}
+	found := false
+	inspectFunc(funcBody(fn), func(n ast.Node) bool {
+		def, ok := n.(*ast.DeferStmt)
+		if !ok || found {
+			return !found
+		}
+		lit, ok := def.Call.Fun.(*ast.FuncLit)
+		if !ok {
+			return true
+		}
+		ast.Inspect(lit.Body, func(n ast.Node) bool {
+			ifs, ok := n.(*ast.IfStmt)
+			if !ok || found || !ef.condIsStatus(ifs.Cond, result, isSentinel) {
+				return !found
+			}
+			for _, st := range ifs.Body.List {
+				as, ok := st.(*ast.AssignStmt)
+				if !ok || len(as.Lhs) != len(as.Rhs) {
+					continue
+				}
+				for i, l := range as.Lhs {
+					if id, ok := unparen(l).(*ast.Ident); ok && ef.info.Uses[id] == result && ef.isStatusExpr(as.Rhs[i]) {
+						found = true
+					}
 				}
 			}
 			return !found
@@ -434,7 +545,8 @@ func (ef *errFlow) classifyErrorf(fn ast.Node, call *ast.CallExpr, depth int) er
 	format, ok := stringArg(ef.info, call, 0)
 	o := errOrigin{kind: errConstructed, node: call, msg: format}
 	for _, arg := range call.Args[1:] {
-		if t := ef.info.TypeOf(arg); isErrorType(t) || looksLikeStatusCode(arg) {
+		// Package-level sentinels have fixed text, so formatting one doesn't leak anything.
+		if t := ef.info.TypeOf(arg); isErrorType(t) && !ef.isPkgVar(arg) || looksLikeStatusCode(arg) {
 			o.formatsErr = true
 		}
 	}
@@ -463,6 +575,20 @@ func (ef *errFlow) classifyErrorf(fn ast.Node, call *ast.CallExpr, depth int) er
 		}
 	}
 	return o
+}
+
+func (ef *errFlow) isPkgVar(e ast.Expr) bool {
+	var id *ast.Ident
+	switch x := unparen(e).(type) {
+	case *ast.Ident:
+		id = x
+	case *ast.SelectorExpr:
+		id = x.Sel
+	default:
+		return false
+	}
+	v, ok := ef.info.Uses[id].(*types.Var)
+	return ok && v.Pkg() != nil && v.Parent() == v.Pkg().Scope()
 }
 
 func looksLikeStatusCode(e ast.Expr) bool {

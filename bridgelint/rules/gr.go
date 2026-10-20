@@ -58,8 +58,6 @@ func isHTTPResponse(t types.Type) bool {
 	return isNamed(t, "net/http", "Response")
 }
 
-var responseMethods = map[string]bool{"Do": true, "Get": true, "Post": true, "Head": true, "PostForm": true, "RoundTrip": true}
-
 // checkBodyClose implements GR001.
 func checkBodyClose(pass *analysis.Pass, fd *ast.FuncDecl) {
 	info := pass.TypesInfo
@@ -77,8 +75,9 @@ func checkBodyClose(pass *analysis.Pass, fd *ast.FuncDecl) {
 		if !ok {
 			return true
 		}
-		obj := calleeObj(info, call)
-		if obj == nil || !responseMethods[obj.Name()] {
+		// Only calls that hand the caller an open body: wrappers may close it before returning.
+		f, ok := calleeObj(info, call).(*types.Func)
+		if !ok || !isHTTPRoundTrip(f) && !isNetworkPrimitive(f) {
 			return true
 		}
 		for _, lhs := range as.Lhs {

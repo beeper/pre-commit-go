@@ -108,3 +108,26 @@ func (c *Client) GetCapabilities(ctx context.Context, isDM bool) *event.RoomFeat
 	}
 	return caps
 }
+
+type apiRequest struct{ c *http.Client }
+
+func (a *apiRequest) Do(ctx context.Context) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := a.c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return resp, nil
+}
+
+func headerFromWrapper(ctx context.Context, a *apiRequest) string {
+	resp, err := a.Do(ctx)
+	if err != nil {
+		return ""
+	}
+	return resp.Header.Get("X-ID")
+}

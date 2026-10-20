@@ -3,7 +3,7 @@ package rules
 import (
 	"go/ast"
 	"go/token"
-	"regexp"
+	"go/types"
 
 	"golang.org/x/tools/go/analysis"
 )
@@ -13,8 +13,6 @@ var EPAnalyzer = &analysis.Analyzer{
 	Doc:  "error plumbing rules (EP001-EP003): errors must be matched by type and carry typed statuses",
 	Run:  runEP,
 }
-
-var httpStatusFormatRegex = regexp.MustCompile(`(?i)\b(http|status|code)\b[^%]{0,20}%d`)
 
 func runEP(pass *analysis.Pass) (any, error) {
 	pi := infoFor(pass)
@@ -61,19 +59,30 @@ func runEP(pass *analysis.Pass) (any, error) {
 }
 
 func checkUntypedHTTPError(pass *analysis.Pass, call *ast.CallExpr) {
-	format, ok := stringArg(pass.TypesInfo, call, 0)
-	if !ok {
-		return
-	}
-	hasStatusArg := false
 	for _, arg := range call.Args[1:] {
-		if sel, ok := unparen(arg).(*ast.SelectorExpr); ok && (sel.Sel.Name == "StatusCode" || sel.Sel.Name == "Status") {
-			hasStatusArg = true
+		if isHTTPResponseStatus(pass.TypesInfo, arg) {
+			report(pass, call, EP002, "HTTP status formatted into a plain error; return a typed error (e.g. *HTTPError{StatusCode}) so callers can tell 429 from 403 from 5xx")
+			return
 		}
 	}
-	if hasStatusArg || httpStatusFormatRegex.MatchString(format) {
-		report(pass, call, EP002, "HTTP status formatted into a plain error; return a typed error (e.g. *HTTPError{StatusCode}) so callers can tell 429 from 403 from 5xx")
+}
+
+// isHTTPResponseStatus matches resp.StatusCode or resp.Status on an HTTP response (net/http or a fork).
+func isHTTPResponseStatus(info *types.Info, e ast.Expr) bool {
+	sel, ok := unparen(e).(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "StatusCode" && sel.Sel.Name != "Status" {
+		return false
 	}
+	selection, ok := info.Selections[sel]
+	if !ok || selection.Kind() != types.FieldVal {
+		return false
+	}
+	t := selection.Recv()
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+	named, ok := types.Unalias(t).(*types.Named)
+	return ok && named.Obj().Name() == "Response"
 }
 
 func containsErrorsJoin(pass *analysis.Pass, e ast.Expr) bool {

@@ -28,6 +28,14 @@ var permanentReasons = map[string]bool{
 	"MessageStatusTooOld":       true,
 }
 
+// errorOnlyLogged are handlers whose errors bridgev2 only logs (or never calls), so no message status
+// is sent for them.
+var errorOnlyLogged = map[string]bool{
+	"HandleMatrixReadReceipt": true,
+	"HandleMatrixTyping":      true,
+	"HandleMatrixViewingChat": true,
+}
+
 func runMSS(pass *analysis.Pass) (any, error) {
 	if len(pass.Files) == 0 {
 		return nil, nil
@@ -44,6 +52,10 @@ func runMSS(pass *analysis.Pass) (any, error) {
 	for _, fd := range pi.funcsWithScope(ScopeMatrixHandler) {
 		idx := errorResultIndex(funcType(pass.TypesInfo, fd))
 		if idx < 0 {
+			continue
+		}
+		if errorOnlyLogged[fd.Name.Name] {
+			checkBlockingSends(pass, fd)
 			continue
 		}
 		usesClassifier := callsAny(pass, pi, fd.Body, classifiers, 2)

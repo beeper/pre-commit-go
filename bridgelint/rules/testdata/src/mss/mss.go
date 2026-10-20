@@ -117,3 +117,10 @@ func bareIgnore(err error) error {
 	//bridgelint:ignore because I said so // want `BL000: bridgelint:ignore must name the rules`
 	return bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusTooOld) // want `MSS002`
 }
+
+func (c *Client) HandleMatrixReadReceipt(ctx context.Context, msg *bridgev2.MatrixMessage) error {
+	_, err := c.client.Send(ctx, "read")
+	return err
+}
+
+var ErrNotLoggedIn = bridgev2.WrapErrorInStatus(fmt.Errorf("you're %w", errLocalSentinel)).WithErrorAsMessage()
