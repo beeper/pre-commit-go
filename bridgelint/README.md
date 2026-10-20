@@ -154,7 +154,7 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 | Rule | Severity | Flags |
 |---|---|---|
 | BS001 | info | An explicit `UserActionRelogin` on `BAD_CREDENTIALS`, when the pinned mautrix already defaults to it (after v0.32.0). |
-| BS002 | error | A restriction code that isn't `BAD_CREDENTIALS` + `OPEN_NATIVE`, or `UserActionRestart` with `BAD_CREDENTIALS`. A restriction code contains one of these whole words (the code is split on anything that isn't a letter or digit): ban(ned), suspend(ed), suspension, restrict(ed), restriction, lock(ed), lockout, checkpoint, consent, challenge, disabled, deactivate(d), or the pairs access-denied, not-offered. Autofix sets `OPEN_NATIVE`. |
+| BS002 | error | A restriction code that isn't `BAD_CREDENTIALS` with `RESTART` (the user fixes it in the app or at a URL, then the bridge is restarted) or `OPEN_NATIVE` (the bridge recovers by itself once the user fixes it in the app). Which of the two is right depends on the bridge, so there's no autofix. A restriction code contains one of these whole words (the code is split on anything that isn't a letter or digit): ban(ned), suspend(ed), suspension, restrict(ed), restriction, lock(ed), lockout, checkpoint, consent, challenge, disabled, deactivate(d), or the pairs access-denied, not-offered. |
 | BS003 | error | `Message` built from `err.Error()` or `fmt.Sprintf(..., err)`. Warning when the code has a `BridgeStateHumanErrors` entry, since the text is then silently discarded. |
 | BS004 | error | An error state with no `Error` code, a code that doesn't match `<error_prefix>-<reason>`, or a code built with `fmt.Sprintf`. |
 | BS005 | warning | A code with no `Message` and no `BridgeStateHumanErrors` entry anywhere in the linted packages. |

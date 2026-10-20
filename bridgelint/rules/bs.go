@@ -212,15 +212,8 @@ func checkStateLit(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, s
 	}
 
 	// BS002
-	if sl.codeOK && isRestrictionCode(sl.code) && !(sl.event == "BAD_CREDENTIALS" && sl.action == "OPEN_NATIVE") && sl.event != "" {
-		msg := fmt.Sprintf("%q looks like a restriction or ban but is sent as %s", sl.code, describeState(sl))
-		var opts []reportOpt
-		if sl.event == "BAD_CREDENTIALS" && (sl.action == "RESTART" || hasCodeWord(sl.code, restrictionFixWords)) {
-			opts = append(opts, userActionFix(pass, sl))
-		}
-		report(pass, lit, BS002, msg+"; restrictions are BAD_CREDENTIALS with UserAction OPEN_NATIVE", opts...)
-	} else if sl.event == "BAD_CREDENTIALS" && sl.action == "RESTART" {
-		report(pass, sl.fields["UserAction"], BS002, "UserActionRestart with BAD_CREDENTIALS; use OPEN_NATIVE for problems the user fixes on the network, or leave it unset for RELOGIN", userActionFix(pass, sl))
+	if sl.codeOK && isRestrictionCode(sl.code) && sl.event != "" && !(sl.event == "BAD_CREDENTIALS" && (sl.action == "RESTART" || sl.action == "OPEN_NATIVE")) {
+		report(pass, lit, BS002, fmt.Sprintf("%q looks like a restriction or ban but is sent as %s; restrictions are BAD_CREDENTIALS with UserAction RESTART (the user fixes it in the app or at a URL, then the bridge is restarted) or OPEN_NATIVE (the bridge recovers by itself once the user fixes it in the app)", sl.code, describeState(sl)))
 	}
 
 	// BS003
@@ -281,47 +274,8 @@ func describeState(sl *stateLit) string {
 	return sl.event + " with no UserAction"
 }
 
-func userActionFix(pass *analysis.Pass, sl *stateLit) reportOpt {
-	value := sl.qual + ".UserActionOpenNative"
-	if existing, ok := sl.fields["UserAction"]; ok {
-		if containsNode(sl.lit, existing) {
-			return withFix("Use UserActionOpenNative", analysis.TextEdit{Pos: existing.Pos(), End: existing.End(), NewText: []byte(value)})
-		}
-		return func(*analysis.Diagnostic, *Severity) {}
-	}
-	lit := sl.lit
-	if len(lit.Elts) == 0 {
-		return withFix("Add UserActionOpenNative", analysis.TextEdit{Pos: lit.Rbrace, End: lit.Rbrace, NewText: []byte("UserAction: " + value)})
-	}
-	last := lit.Elts[len(lit.Elts)-1]
-	if pass.Fset.Position(lit.Rbrace).Line == pass.Fset.Position(last.End()).Line {
-		return withFix("Add UserActionOpenNative", analysis.TextEdit{Pos: last.End(), End: last.End(), NewText: []byte(", UserAction: " + value)})
-	}
-	indent := lineIndent(pass, last.Pos())
-	rbraceIndent := lineIndent(pass, lit.Rbrace)
-	return withFix("Add UserActionOpenNative", analysis.TextEdit{
-		Pos:     lit.Rbrace,
-		End:     lit.Rbrace,
-		NewText: []byte(strings.TrimPrefix(indent, rbraceIndent) + "UserAction: " + value + ",\n" + rbraceIndent),
-	})
-}
-
 func containsNode(outer, inner ast.Node) bool {
 	return inner.Pos() >= outer.Pos() && inner.End() <= outer.End()
-}
-
-func lineIndent(pass *analysis.Pass, pos token.Pos) string {
-	p := pass.Fset.Position(pos)
-	data, err := readFile(pass, p.Filename)
-	if err != nil {
-		return ""
-	}
-	start := p.Offset - (p.Column - 1)
-	if start < 0 || p.Offset > len(data) {
-		return ""
-	}
-	line := data[start:p.Offset]
-	return string(line[:len(line)-len(strings.TrimLeft(string(line), " \t"))])
 }
 
 func readFile(pass *analysis.Pass, name string) ([]byte, error) {
@@ -509,12 +463,6 @@ var restrictionWords = map[string]bool{
 
 // restrictionPhrases are adjacent word pairs with the same meaning.
 var restrictionPhrases = [][2]string{{"access", "denied"}, {"not", "offered"}}
-
-// restrictionFixWords are the restrictions whose autofix to OPEN_NATIVE is unambiguous.
-var restrictionFixWords = map[string]bool{
-	"ban": true, "banned": true, "suspend": true, "suspended": true, "suspension": true,
-	"restrict": true, "restricted": true, "restriction": true, "locked": true, "checkpoint": true,
-}
 
 func codeWords(code string) []string {
 	return strings.FieldsFunc(strings.ToLower(code), func(r rune) bool {
