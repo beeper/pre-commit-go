@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"example.com/netlib"
 	"maunium.net/go/mautrix/bridgev2"
@@ -56,6 +57,14 @@ func (c *Client) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit)
 	select {
 	case c.events <- "edit":
 	default:
+	}
+	select {
+	case c.events <- "edit":
+	case <-time.After(time.Second):
+	}
+	select {
+	case c.events <- "edit": // want `GR007: HandleMatrixEdit does a channel send`
+	case c.events <- "again": // want `GR007: HandleMatrixEdit does a channel send`
 	}
 	return mapped(err)
 }

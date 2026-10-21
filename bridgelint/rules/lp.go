@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/constant"
+	"go/token"
 	"go/types"
 	"strconv"
 	"strings"
@@ -186,7 +187,7 @@ func checkRespErrLit(pass *analysis.Pass, pi *pkgInfo, file *ast.File, lit *ast.
 	}
 
 	// LP005
-	if re.status == nil && !parentCallsWithStatus(pi, lit) && pass.Pkg.Path() != pathMautrix {
+	if re.status == nil && !parentCallsWithStatus(pi, lit) && !passedAsData(info, pi, lit) && pass.Pkg.Path() != pathMautrix {
 		report(pass, lit, LP005, "RespError literal without StatusCode is sent as 500; set the status that matches the cause")
 	}
 
@@ -194,7 +195,7 @@ func checkRespErrLit(pass *analysis.Pass, pi *pkgInfo, file *ast.File, lit *ast.
 	if sc, ok := standardCodes[re.code]; ok && re.codeKnown {
 		msg := fmt.Sprintf("RespError literal for %s; use mautrix.%s.WithMessage(...) so the status can't drift from the code", re.code, sc.name)
 		var opts []reportOpt
-		if fix, ok := lp007Fix(pass, file, re, sc.name, sc.status); ok {
+		if fix, ok := lp007Fix(pass, pi, file, re, sc.name, sc.status); ok {
 			opts = append(opts, fix)
 		}
 		report(pass, lit, LP007, msg, opts...)
@@ -204,6 +205,45 @@ func checkRespErrLit(pass *analysis.Pass, pi *pkgInfo, file *ast.File, lit *ast.
 func parentCallsWithStatus(pi *pkgInfo, lit *ast.CompositeLit) bool {
 	sel, ok := pi.parents[lit].(*ast.SelectorExpr)
 	return ok && sel.Sel.Name == "WithStatus"
+}
+
+// passedAsData reports whether lit, or &lit, is the argument for an interface{} parameter, like the body
+// of exhttp.WriteJSONResponse(w, status, body): it's serialized, and its StatusCode isn't what's sent.
+func passedAsData(info *types.Info, pi *pkgInfo, lit *ast.CompositeLit) bool {
+	var arg ast.Expr = lit
+	if u, ok := pi.parents[lit].(*ast.UnaryExpr); ok && u.Op == token.AND {
+		arg = u
+	}
+	call, ok := pi.parents[arg].(*ast.CallExpr)
+	if !ok || call.Ellipsis.IsValid() || info.TypeOf(call.Fun) == nil {
+		return false
+	}
+	sig, ok := info.TypeOf(call.Fun).Underlying().(*types.Signature)
+	if !ok {
+		return false
+	}
+	params := sig.Params()
+	for i, a := range call.Args {
+		if a != arg {
+			continue
+		}
+		var t types.Type
+		switch {
+		case sig.Variadic() && i >= params.Len()-1:
+			slice, ok := params.At(params.Len() - 1).Type().(*types.Slice)
+			if !ok {
+				return false
+			}
+			t = slice.Elem()
+		case i < params.Len():
+			t = params.At(i).Type()
+		default:
+			return false
+		}
+		iface, ok := t.Underlying().(*types.Interface)
+		return ok && iface.Empty()
+	}
+	return false
 }
 
 func statusBadRequest(file *ast.File) string {
@@ -227,7 +267,14 @@ func importName(file *ast.File, path string) (string, bool) {
 	return "", false
 }
 
-func lp007Fix(pass *analysis.Pass, file *ast.File, re *respErr, varName string, defaultStatus int) (reportOpt, bool) {
+func lp007Fix(pass *analysis.Pass, pi *pkgInfo, file *ast.File, re *respErr, varName string, defaultStatus int) (reportOpt, bool) {
+	// The replacement is a method call, which can't be addressed or stand in for an elided *RespError.
+	if u, ok := pi.parents[re.lit].(*ast.UnaryExpr); ok && u.Op == token.AND {
+		return nil, false
+	}
+	if _, isPtr := pass.TypesInfo.TypeOf(re.lit).(*types.Pointer); isPtr {
+		return nil, false
+	}
 	for name := range re.fields {
 		if name != "ErrCode" && name != "Err" && name != "StatusCode" {
 			return nil, false
@@ -242,7 +289,12 @@ func lp007Fix(pass *analysis.Pass, file *ast.File, re *respErr, varName string, 
 	if e, ok := re.fields["Err"]; ok {
 		b.WriteString(".WithMessage(" + nodeText(pass, e) + ")")
 	}
-	if re.status != nil && !(re.statusKnow && re.statusVal == int64(defaultStatus)) {
+	sends429 := re.status == nil && defaultStatus == 429 || re.statusKnow && re.statusVal == 429
+	switch {
+	case re.code == "M_LIMIT_EXCEEDED" && sends429 && !explicitlyRetriable(pi, pass.TypesInfo, re.lit):
+		// mautrix.MLimitExceeded is 429, which LP002 rejects.
+		b.WriteString(".WithStatus(" + statusBadRequest(file) + ")")
+	case re.status != nil && !(re.statusKnow && re.statusVal == int64(defaultStatus)):
 		b.WriteString(".WithStatus(" + nodeText(pass, re.status) + ")")
 	}
 	text := b.String()
@@ -414,7 +466,9 @@ func checkDuplicateValidation(pass *analysis.Pass, pi *pkgInfo, fd *ast.FuncDecl
 		case isPkgFunc(obj, "regexp", "MatchString") && len(call.Args) == 2:
 			pattern, found = constString(info, call.Args[0])
 		case obj != nil && obj.Name() == "MatchString" && isNamed(recvType(obj), "regexp", "Regexp"):
-			pattern, found = regexpPattern(info, ef, call.Fun.(*ast.SelectorExpr).X)
+			if sel, ok := unparen(call.Fun).(*ast.SelectorExpr); ok {
+				pattern, found = regexpPattern(info, ef, sel.X)
+			}
 		}
 		if found && patterns[pattern] {
 			report(pass, call, LP008, "this check duplicates the Pattern on the login field; drop it and let step validation handle the input")

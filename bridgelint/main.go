@@ -77,7 +77,8 @@ type jsonDiagnostic struct {
 type finding struct {
 	rule     string
 	severity rules.Severity
-	pos      token.Position
+	pos      token.Position // filename relative to the working directory, for printing
+	file     string         // absolute path
 	message  string
 	snippet  string
 	fixes    []suggestedFix
@@ -207,20 +208,39 @@ func moduleRoot() string {
 	}
 }
 
-// mautrixVersion asks the go command which mautrix the current module builds against.
+// mautrixVersion asks the go command which mautrix the current module builds against. A local checkout
+// (a filesystem replace or a go.work module) is "local@<commit time>" from its git HEAD, or just "local"
+// when that can't be read.
 func mautrixVersion() string {
-	out, err := exec.Command("go", "list", "-m", "-f", "{{.Version}}|{{with .Replace}}{{.Version}}|{{.Path}}{{end}}", "maunium.net/go/mautrix").Output()
+	out, err := exec.Command("go", "list", "-m", "-json", "maunium.net/go/mautrix").Output()
 	if err != nil {
 		return ""
 	}
-	parts := strings.Split(strings.TrimSpace(string(out)), "|")
-	if len(parts) >= 3 && parts[2] != "" {
-		if parts[1] == "" {
-			return "local"
-		}
-		return parts[1]
+	var mod struct {
+		Version string
+		Main    bool
+		Dir     string
+		Replace *struct{ Version, Dir string }
 	}
-	return parts[0]
+	if err := json.Unmarshal(out, &mod); err != nil {
+		return ""
+	}
+	var dir string
+	switch {
+	case mod.Replace != nil && mod.Replace.Version != "":
+		return mod.Replace.Version
+	case mod.Replace != nil:
+		dir = mod.Replace.Dir
+	case mod.Main:
+		dir = mod.Dir
+	default:
+		return mod.Version
+	}
+	commitTime, err := exec.Command("git", "-C", dir, "log", "-1", "--format=%cI").Output()
+	if dir == "" || err != nil {
+		return "local"
+	}
+	return "local@" + strings.TrimSpace(string(commitTime))
 }
 
 func printRules() {
@@ -272,14 +292,20 @@ func run(patterns []string) int {
 		return 2
 	}
 	sort.Slice(findings, func(i, j int) bool {
-		a, b := findings[i].pos, findings[j].pos
-		if a.Filename != b.Filename {
-			return a.Filename < b.Filename
+		a, b := findings[i], findings[j]
+		if a.pos.Filename != b.pos.Filename {
+			return a.pos.Filename < b.pos.Filename
 		}
-		if a.Line != b.Line {
-			return a.Line < b.Line
+		if a.pos.Line != b.pos.Line {
+			return a.pos.Line < b.pos.Line
 		}
-		return a.Column < b.Column
+		if a.pos.Column != b.pos.Column {
+			return a.pos.Column < b.pos.Column
+		}
+		if a.rule != b.rule {
+			return a.rule < b.rule
+		}
+		return a.message < b.message
 	})
 
 	if *writeBaseline {
@@ -287,7 +313,7 @@ func run(patterns []string) int {
 			fmt.Fprintln(os.Stderr, "bridgelint: -write-baseline needs -baseline")
 			return 2
 		}
-		if err := saveBaseline(*baselinePath, findings); err != nil {
+		if err := saveBaseline(*baselinePath, moduleRoot(), findings); err != nil {
 			fmt.Fprintf(os.Stderr, "bridgelint: %v\n", err)
 			return 2
 		}
@@ -295,7 +321,7 @@ func run(patterns []string) int {
 		return 0
 	}
 	if *baselinePath != "" {
-		findings, err = filterBaseline(*baselinePath, findings)
+		findings, err = filterBaseline(*baselinePath, moduleRoot(), findings)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "bridgelint: %v\n", err)
 			return 2
@@ -375,12 +401,13 @@ func parseVetJSON(r io.Reader) ([]finding, []string, error) {
 						continue
 					}
 					seen[key] = true
+					file := pos.Filename
 					snippet := lineText(pos)
 					if rel, err := filepath.Rel(cwd, pos.Filename); err == nil && !strings.HasPrefix(rel, "..") {
 						pos.Filename = rel
 					}
 					id, sev := rules.SplitCategory(d.Category)
-					findings = append(findings, finding{rule: id, severity: sev, pos: pos, message: d.Message, snippet: snippet, fixes: d.SuggestedFixes})
+					findings = append(findings, finding{rule: id, severity: sev, pos: pos, file: file, message: d.Message, snippet: snippet, fixes: d.SuggestedFixes})
 				}
 			}
 		}
@@ -448,16 +475,22 @@ type baselineFile struct {
 	Findings []baselineEntry `json:"findings"`
 }
 
-func baselineKey(f finding) baselineEntry {
+// baselineKey identifies a finding by rule, file relative to the module root (so the baseline works from
+// any directory) and a hash of its normalised source line.
+func baselineKey(root string, f finding) baselineEntry {
+	file := f.file
+	if rel, err := filepath.Rel(root, f.file); err == nil {
+		file = rel
+	}
 	sum := sha256.Sum256([]byte(strings.Join(strings.Fields(f.snippet), " ")))
-	return baselineEntry{Rule: f.rule, File: filepath.ToSlash(f.pos.Filename), SnippetHash: hex.EncodeToString(sum[:8])}
+	return baselineEntry{Rule: f.rule, File: filepath.ToSlash(file), SnippetHash: hex.EncodeToString(sum[:8])}
 }
 
-func saveBaseline(path string, findings []finding) error {
+func saveBaseline(path, root string, findings []finding) error {
 	counts := map[baselineEntry]int{}
 	var order []baselineEntry
 	for _, f := range findings {
-		k := baselineKey(f)
+		k := baselineKey(root, f)
 		if counts[k] == 0 {
 			order = append(order, k)
 		}
@@ -476,7 +509,7 @@ func saveBaseline(path string, findings []finding) error {
 	return os.WriteFile(path, append(data, '\n'), 0o644)
 }
 
-func filterBaseline(path string, findings []finding) ([]finding, error) {
+func filterBaseline(path, root string, findings []finding) ([]finding, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return findings, nil
@@ -495,7 +528,7 @@ func filterBaseline(path string, findings []finding) ([]finding, error) {
 	}
 	var out []finding
 	for _, f := range findings {
-		k := baselineKey(f)
+		k := baselineKey(root, f)
 		if budget[k] > 0 {
 			budget[k]--
 			continue
@@ -539,7 +572,13 @@ func fix(findings []finding) error {
 			byFile[e.Filename] = append(byFile[e.Filename], e)
 		}
 	}
-	for name, edits := range byFile {
+	names := make([]string, 0, len(byFile))
+	for name := range byFile {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		edits := byFile[name]
 		data, err := os.ReadFile(name)
 		if err != nil {
 			return err

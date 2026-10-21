@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/constant"
 	"go/types"
+	"sort"
 	"strings"
 	"sync"
 
@@ -184,6 +185,17 @@ func (pi *pkgInfo) declOf(call *ast.CallExpr) *ast.FuncDecl {
 	return pi.decls[fn.Origin()]
 }
 
+// declsInOrder returns the package's function declarations in source order, for rules that report only
+// the first of several matches.
+func (pi *pkgInfo) declsInOrder() []*ast.FuncDecl {
+	out := make([]*ast.FuncDecl, 0, len(pi.decls))
+	for _, fd := range pi.decls {
+		out = append(out, fd)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Pos() < out[j].Pos() })
+	return out
+}
+
 func (pi *pkgInfo) funcsWithScope(s Scope) []*ast.FuncDecl {
 	var out []*ast.FuncDecl
 	for fd, scope := range pi.scopes {
@@ -238,8 +250,16 @@ func isNamed(t types.Type, path, name string) bool {
 	return n.Obj().Pkg().Path() == path && n.Obj().Name() == name
 }
 
-// isHTTPStruct reports whether t, after dropping a pointer, is a named type called name. The package
-// isn't checked: net/http forks like fhttp declare their own Request and Response.
+// httpStructFields are fields that net/http's Request and Response have and an API's own type with the
+// same name usually doesn't.
+var httpStructFields = map[string][]string{
+	"Request":  {"Method", "URL", "Header", "Body", "GetBody"},
+	"Response": {"Status", "StatusCode", "Header", "Body"},
+}
+
+// isHTTPStruct reports whether t, after dropping a pointer, is a struct called name with the fields of
+// net/http's type of that name. The package isn't checked: net/http forks like fhttp declare their own
+// Request and Response.
 func isHTTPStruct(t types.Type, name string) bool {
 	if t == nil {
 		return false
@@ -248,7 +268,23 @@ func isHTTPStruct(t types.Type, name string) bool {
 		t = ptr.Elem()
 	}
 	named, ok := types.Unalias(t).(*types.Named)
-	return ok && named.Obj().Name() == name
+	if !ok || named.Obj().Name() != name {
+		return false
+	}
+	st, ok := named.Underlying().(*types.Struct)
+	if !ok {
+		return false
+	}
+	have := map[string]bool{}
+	for i := 0; i < st.NumFields(); i++ {
+		have[st.Field(i).Name()] = true
+	}
+	for _, field := range httpStructFields[name] {
+		if !have[field] {
+			return false
+		}
+	}
+	return true
 }
 
 var errorType = types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
@@ -266,11 +302,10 @@ func constString(info *types.Info, e ast.Expr) (string, bool) {
 	if !ok || tv.Value == nil {
 		return "", false
 	}
-	s := tv.Value.ExactString()
-	if len(s) >= 2 && s[0] == '"' {
-		return strings.Trim(s, `"`), true
+	if tv.Value.Kind() == constant.String {
+		return constant.StringVal(tv.Value), true
 	}
-	return s, true
+	return tv.Value.ExactString(), true
 }
 
 func constInt(info *types.Info, e ast.Expr) (int64, bool) {

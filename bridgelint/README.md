@@ -58,8 +58,8 @@ bridgelint -baseline=bridgelint.baseline.json -write-baseline ./...
 bridgelint -baseline=bridgelint.baseline.json ./...   # only reports findings not in the baseline
 ```
 
-Findings are matched by rule, file and a hash of the normalised source line, so they survive unrelated
-edits that move lines around.
+Findings are matched by rule, file (relative to the module root, so it works from any directory) and a
+hash of the normalised source line, so they survive unrelated edits that move lines around.
 
 ### Suppressing a finding
 
@@ -83,7 +83,7 @@ error result (`if err != nil { err = wrap(err) }`) is treated as mapped.
 ### Configuration
 
 `bridgelint` reads the nearest `.bridgelint.yaml` above each package (stopping at `go.mod`), or the file
-given with `-config`. Everything is optional:
+given with `-config`. Everything is optional, and unknown keys, rule IDs and severities are errors:
 
 ```yaml
 error_prefix: slack                      # BS004: codes must look like slack-<reason>
@@ -100,8 +100,11 @@ disconnect_events:                       # BS009: event types that signal a drop
 helper_depth: 3                          # how far errors are followed through same-package helpers
 disable: [GR009]
 severity:
-  GR012: info
+  BS005: info
 ```
+
+`disconnect_events` adds to the built-in entries for discordgo and slack-go; an empty list turns a
+library's check off.
 
 An error counts as a raw network error when it comes from a function that can reach the network.
 bridgelint follows calls from source through every package the bridge depends on, except the standard
@@ -115,20 +118,26 @@ library, bridgev2 and `go.mau.fi/util`, down to these standard library calls:
 Calls through interfaces declared outside the standard library are resolved against the implementations
 visible from the calling package, so a library's transport interface resolves once the bridge imports
 the implementation. Goroutines count when the function waits on a channel they send to. Function
-literals count when they're called or passed to a call, not when they're stored.
+literals count when they're called or passed to a call, not when they're stored, and so do functions and
+methods passed to a call by name (`retry(ctx, c.send)`).
 
 Libraries that keep a persistent connection usually write to it in ways that can't be followed without
 tracking values: through a `bufio.Writer` around the connection (websocket libraries), a chain of func
 values (MTProto), or an interface whose implementation the library can't see. So a function also counts
 when it takes a `context.Context`, belongs to a network library or the module being linted, and makes
 one of these calls: a context-taking call through a func value or through an interface with no visible
-implementation, or a read or write on a `bufio.Reader`/`Writer` kept in a struct field. A network
+implementation, or a read or write on a `bufio.Reader`/`Writer` kept in a struct field. A call through
+one of the function's own parameters doesn't count, since what's passed in is followed where it's
+passed: a transaction helper `withTx(ctx, fn)` is as visible as the literals given to it. A network
 library is a package that has functions reaching the network, or imports one. A context-taking helper
 that doesn't do any of this (an audio converter, a database layer) never counts.
 
 Functions in the module that return bridgev2 statuses themselves, like message converters, are followed
-instead, so the statuses they return count as mapped. Package-level error values count as network errors
-when their package is a network library. Set `network_packages` to make every function in a package
+instead, so the statuses they return count as mapped. So are functions in the module whose every return
+can be classified: a converter that logs a failed upload and returns a fixed `ErrUploadFailed` doesn't
+return a network error, even though it reaches the network. One with returns that can't be classified
+(a naked return, an error read from a field) still counts as returning whatever the network gives it.
+Package-level error values count as network errors when their package is a network library. Set `network_packages` to make every function in a package
 count as reaching the network.
 
 Plain `errors.New`/`fmt.Errorf` errors that don't wrap a network error are treated as internal
@@ -139,7 +148,8 @@ Returns inside a function literal aren't followed, so a handler that does its wo
 (`return c.withLock(func() error { ... })`) isn't checked.
 
 Rules that depend on newer bridgev2 behaviour check the module's `maunium.net/go/mautrix` version (from
-`go list -m`) and stay quiet when the pinned version doesn't have it.
+`go list -m`) and stay quiet when the pinned version doesn't have it. A local checkout (a filesystem
+`replace` or a `go.work` module) is judged by the commit time of its git `HEAD`.
 
 ## Rules
 
@@ -155,20 +165,22 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 | MSS003 | warning | Raw error text shown to users: `WithErrorAsMessage()` on a library error or on `fmt.Errorf` that formats another error or status code, or `WithMessage(err.Error())`. |
 | MSS004 | warning | `WithIsCertain(true)` on a timeout: `context.DeadlineExceeded`, `os.ErrDeadlineExceeded` or `net.Error.Timeout()`. A library's own timeout error isn't recognised. |
 | MSS005 | info | A `MessageStatus` literal with a message and certainty but no `ErrorReason` (`WrapErrorInStatus` already defaults it to `GenericError`). |
-| MSS006 | warning | The package has a typed error classifier (a `func(error) string/int` named like `*Code`/`*Kind`/`*Status` that calls `errors.As`, or one listed in `classifiers`) but a handler returns network errors without using it. Name heuristic. |
+| MSS006 | warning | The package has a typed error classifier (a `func(error) string/int` with Code, Kind, Class, Reason or Status as a word of its name, like `slackErrorCode` or `codeOf`, that calls `errors.As`, or one listed in `classifiers`) but a handler returns network errors without using it. Name heuristic. |
 
 ### Bridge states (BS)
+
+`LOGGED_OUT` means the user logged out on purpose, so it isn't treated as an error state.
 
 | Rule | Severity | Flags |
 |---|---|---|
 | BS001 | info | An explicit `UserActionRelogin` on `BAD_CREDENTIALS`, when the pinned mautrix already defaults to it (after v0.32.0). |
-| BS002 | error | A restriction code that isn't `BAD_CREDENTIALS` with `RESTART` (the user fixes it in the app or at a URL, then the bridge is restarted) or `OPEN_NATIVE` (the bridge recovers by itself once the user fixes it in the app). Which of the two is right depends on the bridge, so there's no autofix. A restriction code contains one of these whole words (the code is split on anything that isn't a letter or digit): ban(ned), suspend(ed), suspension, restrict(ed), restriction, lock(ed), lockout, checkpoint, consent, challenge, disabled, deactivate(d), or the pairs access-denied, not-offered. |
+| BS002 | warning | A restriction code that isn't `BAD_CREDENTIALS` with `RESTART` (the user fixes it in the app or at a URL, then the bridge is restarted) or `OPEN_NATIVE` (the bridge recovers by itself once the user fixes it in the app). Which of the two is right depends on the bridge, so there's no autofix. A restriction code contains one of these whole words (the code is split on anything that isn't a letter or digit): ban(ned), suspend(ed), suspension, restrict(ed), restriction, lock(ed), lockout, checkpoint, consent, challenge, disabled, deactivate(d), or the pairs access-denied, not-offered. It's a warning because it matches words in the code. |
 | BS003 | error | `Message` built from `err.Error()` or `fmt.Sprintf(..., err)`. Warning when the code has a `BridgeStateHumanErrors` entry, since the text is then silently discarded. |
 | BS004 | error | An error state with no `Error` code, a code that doesn't match `<error_prefix>-<reason>`, or a code built with `fmt.Sprintf`. |
-| BS005 | warning | A code with no `Message` and no `BridgeStateHumanErrors` entry anywhere in the linted packages. |
+| BS005 | warning | A code with no `Message` and no `BridgeStateHumanErrors` entry in the package or the packages it imports. |
 | BS009 | warning | An event-handler type switch for a configured library with no case for its disconnect events. The switch is recognised by its case types being named like events, a name heuristic. |
-| BS010 | warning | `TRANSIENT_DISCONNECT` reached under a check for a rejected session: a comparison against 401 or 403 (`http.StatusUnauthorized` and friends included, since they're constants), or `errors.Is`/`errors.As` against one of the `auth_errors`. |
-| BS011 | warning | `BAD_CREDENTIALS` for every connect error: in a `default`/`else` branch whose condition tests an error without checking for a rejected session, or directly under `if err != nil` on a network call. |
+| BS010 | warning | `TRANSIENT_DISCONNECT` reached only after a check for a rejected session: a comparison against 401 or 403 (`http.StatusUnauthorized` and friends included, since they're constants), or `errors.Is`/`errors.As` against one of the `auth_errors`. A negated check (`!= 401`, `!errors.Is`) guards its `else` branch. |
+| BS011 | warning | `BAD_CREDENTIALS` for every connect error: in a `default`/`else` branch whose condition tells errors apart without checking for a rejected session, or for any error from a network call (directly under `if err != nil`, or in the `else` of `if err == nil`). |
 
 ### Login and provisioning (LP)
 
@@ -186,8 +198,8 @@ phone, for example) asks for retries deliberately and isn't reported.
 | LP001 | error | A login or provisioning method returns a network error instead of a `bridgev2.RespError`, or `CreateLogin` returns a plain error directly in the `default` of a `switch` on the flow ID or in an `if` on it. Other plain errors aren't reported: nothing distinguishes bad input from an internal invariant. |
 | LP002 | error | A `RespError` with status 429, 502, 503 or 504, including `mautrix.MLimitExceeded` without `WithStatus` (429 by default). Autofix sets 400 when the code is `M_LIMIT_EXCEEDED`. |
 | LP004 | warning | A `RespError` status copied from a network error code (`StatusCode: te.Code`). |
-| LP005 | warning | A `RespError` literal without `StatusCode`, which is sent as 500. |
-| LP007 | info | A `RespError` literal for a standard Matrix code; use `mautrix.MLimitExceeded.WithMessage(...)` and friends so the status can't drift from the code. Autofix rewrites it. |
+| LP005 | warning | A `RespError` literal without `StatusCode`, which is sent as 500. A literal passed as an `any` argument, like the body of `exhttp.WriteJSONResponse(w, status, body)`, isn't reported, since the writer sets the status. |
+| LP007 | info | A `RespError` literal for a standard Matrix code; use `mautrix.MLimitExceeded.WithMessage(...)` and friends so the status can't drift from the code. Autofix rewrites it (not `&RespError{...}`), with 400 for `M_LIMIT_EXCEEDED`. |
 | LP008 | info | A login method re-checks a submitted field against the same regex as the field's `Pattern`. |
 
 ### Error plumbing (EP)
@@ -195,7 +207,7 @@ phone, for example) asks for retries deliberately and isn't reported.
 | Rule | Severity | Flags |
 |---|---|---|
 | EP001 | error | Errors matched by exact string: `err.Error() == "..."`, `switch err.Error()`, `strings.EqualFold(err.Error(), ...)`. Comparisons with `""` and substring matches aren't flagged, since some servers only give text. |
-| EP002 | warning | In library packages (ones that don't import bridgev2), an `http.Response` status formatted into a plain error, so callers can't tell 429 from 403 from 5xx. |
+| EP002 | warning | In library packages (ones that don't import bridgev2, other than `main`), an `http.Response` status formatted into a plain error, so callers can't tell 429 from 403 from 5xx. Forks like fhttp count when their `Response` has net/http's fields. |
 | EP003 | info | `errors.Join` returned from a Matrix handler or used as a user-facing message. |
 
 ### General reliability (GR)
@@ -206,7 +218,7 @@ phone, for example) asks for retries deliberately and isn't reported.
 | GR002 | warning | `http.Get`/`Post`/`Head`, `http.NewRequest` without a context, or `http.DefaultClient`. |
 | GR003 | warning | A request built once with a body and re-sent with `Do` inside a loop; the body is empty on retries. |
 | GR004 | error | `os.Exit`, `log.Fatal*` or zerolog `Fatal()` outside `main`, `init` and `Must*` functions. Panics, including `log.Panic*` and zerolog `Panic()`, aren't flagged: they're alerted on and fixed at the source. |
-| GR007 | warning | A blocking channel send in a Matrix handler (no `select` with `default` or `ctx.Done()`). |
+| GR007 | warning | A blocking channel send in a Matrix handler: no `select` with a `default` or a receive case like `ctx.Done()`, a timer or a stop channel. |
 | GR008 | warning | A cursor/seq/checkpoint field assigned after a loop that calls `QueueRemoteEvent`, before the events are handled. The field is recognised by name, a name heuristic. |
 | GR009 | warning | A package-level map or slice written at runtime in a bridge package, shared by every login. |
 | GR011 | warning | `GetCapabilities` changes `RoomFeatures` fields but never the `ID`, so clients cache the wrong features. |

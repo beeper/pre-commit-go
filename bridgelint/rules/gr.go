@@ -18,7 +18,7 @@ var GRAnalyzer = &analysis.Analyzer{
 }
 
 var (
-	cursorFieldRegex = regexp.MustCompile(`(?i)cursor|seq|checkpoint|sync_?token|^pts$|Pts$`)
+	cursorFieldRegex = regexp.MustCompile(`(?i:cursor|checkpoint|sync_?token)|(^|_)seq|Seq|^[Pp]ts$|Pts$`)
 	stopNameRegex    = regexp.MustCompile(`(?i)disconnect|stop|close|cancel|shutdown`)
 )
 
@@ -360,8 +360,8 @@ func checkCursorBeforeHandled(pass *analysis.Pass, fd *ast.FuncDecl) {
 func checkSharedState(pass *analysis.Pass, pi *pkgInfo) {
 	info := pass.TypesInfo
 	reported := map[types.Object]bool{}
-	for fobj, fd := range pi.decls {
-		if fd.Recv == nil && fobj.Name() == "init" {
+	for _, fd := range pi.declsInOrder() {
+		if fd.Recv == nil && fd.Name.Name == "init" {
 			continue
 		}
 		if isTestFile(pass, fd) {

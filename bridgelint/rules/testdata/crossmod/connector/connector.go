@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"example.com/crossmod/conv"
+	"example.com/crossmod/db"
 	"example.com/crossmod/lib"
 	"example.com/netlib"
 	"example.com/netlib/memstore"
@@ -14,6 +15,7 @@ import (
 type Client struct {
 	lib *lib.Client
 	net *netlib.Client
+	db  *db.Store
 }
 
 var _ bridgev2.NetworkAPI = (*Client)(nil)
@@ -39,7 +41,26 @@ func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMe
 	if err = c.lib.Send(ctx, text); err != nil {
 		return nil, err // want `MSS001: HandleMatrixMessage returns raw error from lib.Send;`
 	}
+	if _, err = conv.Upload(ctx, c.net, text); err != nil {
+		return nil, err
+	}
+	if _, err = conv.Forward(ctx, c.net, text); err != nil {
+		return nil, err // want `MSS001: HandleMatrixMessage returns raw error from conv.Forward;`
+	}
 	return &bridgev2.MatrixMessageResponse{}, nil
+}
+
+func (c *Client) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2.MatrixReaction) error { // want HandleMatrixReactionRemove:"raw .*callee=lib.Post"
+	if err := c.db.Insert(ctx, "x"); err != nil {
+		return err
+	}
+	if err := c.lib.Post(ctx); err != nil {
+		return err // want `MSS001: HandleMatrixReactionRemove returns raw error from lib.Post;`
+	}
+	if err := c.lib.Notify(ctx); err != nil {
+		return err // want `MSS001: HandleMatrixReactionRemove returns raw error from lib.Notify;`
+	}
+	return nil
 }
 
 func (c *Client) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error { // want HandleMatrixEdit:"raw .*callee=netlib.Publish"

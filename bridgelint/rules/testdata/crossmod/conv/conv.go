@@ -4,6 +4,7 @@ package conv
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"example.com/netlib"
@@ -19,4 +20,23 @@ func ToNetwork(ctx context.Context, client *netlib.Client, msg *bridgev2.MatrixM
 		return "", fmt.Errorf("%w: %w", bridgev2.ErrMediaTooLarge, err)
 	}
 	return id, nil
+}
+
+var ErrUploadFailed = errors.New("failed to upload media")
+
+// Upload turns the network error into a fixed one, so callers get an internal error rather than a raw
+// network error.
+func Upload(ctx context.Context, client *netlib.Client, data string) (string, error) { // want Upload:"constructed .*complete=true"
+	id, err := client.Send(ctx, data)
+	if err != nil {
+		return "", ErrUploadFailed
+	}
+	return id, nil
+}
+
+func Forward(ctx context.Context, client *netlib.Client, data string) (string, error) { // want Forward:"raw .*callee=netlib.Send"
+	if data == "" {
+		return "", ErrUploadFailed
+	}
+	return client.Send(ctx, data)
 }

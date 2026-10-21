@@ -41,8 +41,8 @@ type netFuncFact struct {
 	Network bool
 	Ifaces  []ifaceRef
 	// Hidden is set when the function makes calls that can't be followed: context-taking calls through
-	// func values or interfaces nothing visible implements, or reads and writes on a buffered connection
-	// kept in a struct field. Protocol libraries reach their connection that way (a websocket writing
+	// func values other than its own parameters or interfaces nothing visible implements, or reads and
+	// writes on a buffered connection kept in a struct field. Protocol libraries reach their connection that way (a websocket writing
 	// through a bufio.Writer, an MTProto client invoking through a chain of func values).
 	Hidden bool
 }
@@ -130,6 +130,40 @@ func runNet(pass *analysis.Pass) (any, error) {
 	for obj, fd := range pi.decls {
 		n := &node{obj: obj, refs: map[ifaceRef]bool{}}
 		nodes[obj] = n
+		visit := func(f *types.Func, call *ast.CallExpr) {
+			f = f.Origin()
+			if pi.decls[f] != nil {
+				n.callees = append(n.callees, f)
+				callers[f] = append(callers[f], obj)
+				return
+			}
+			if isNetworkPrimitive(f) {
+				r.local[obj] = true
+				return
+			}
+			if ref, ok := r.ifaceRefOf(f); ok {
+				ref.Ctx = passesContext(pass.TypesInfo, call)
+				n.refs[ref] = true
+				return
+			}
+			network, refs, hidden := r.imported(f)
+			if network {
+				r.local[obj] = true
+			}
+			if hidden {
+				r.hidden[obj] = true
+			}
+			for _, ref := range refs {
+				n.refs[ref] = true
+			}
+		}
+		// A function's own func parameters are followed where they're passed in, so calling one isn't a
+		// call that can't be followed.
+		params := map[types.Object]bool{}
+		sig := obj.Type().(*types.Signature)
+		for i := 0; i < sig.Params().Len(); i++ {
+			params[sig.Params().At(i)] = true
+		}
 		// Function literals count as part of the function only when they're called right away or passed
 		// to a call as a callback; one that's stored or returned runs later, if at all.
 		calledLits := map[*ast.FuncLit]bool{}
@@ -153,47 +187,29 @@ func runNet(pass *analysis.Pass) (any, error) {
 			if lit, ok := unparen(call.Fun).(*ast.FuncLit); ok {
 				calledLits[lit] = true
 			}
+			// Callbacks run as part of the call: functions and methods passed by name count as called, and
+			// func values from anywhere but the parameters can't be followed.
 			for _, arg := range call.Args {
-				if lit, ok := unparen(arg).(*ast.FuncLit); ok {
+				if lit := asFuncLit(arg); lit != nil {
 					calledLits[lit] = true
+				} else if f := funcRef(pass.TypesInfo, arg); f != nil {
+					visit(f, call)
+				} else if isFuncValue(pass.TypesInfo, arg) && !params[usedObj(pass.TypesInfo, arg)] && passesContext(pass.TypesInfo, call) {
+					r.hidden[obj] = true
 				}
 			}
 			callee := typeutil.Callee(pass.TypesInfo, call)
 			f, ok := callee.(*types.Func)
 			if !ok {
-				if _, builtin := callee.(*types.Builtin); !builtin && !pass.TypesInfo.Types[call.Fun].IsType() && asFuncLit(call.Fun) == nil && passesContext(pass.TypesInfo, call) {
+				if _, builtin := callee.(*types.Builtin); !builtin && !pass.TypesInfo.Types[call.Fun].IsType() && asFuncLit(call.Fun) == nil && !params[callee] && passesContext(pass.TypesInfo, call) {
 					r.hidden[obj] = true
 				}
 				return true
 			}
-			f = f.Origin()
 			if isBufferedConnIO(f, call) {
 				r.hidden[obj] = true
 			}
-			if pi.decls[f] != nil {
-				n.callees = append(n.callees, f)
-				callers[f] = append(callers[f], obj)
-				return true
-			}
-			if isNetworkPrimitive(f) {
-				r.local[obj] = true
-				return true
-			}
-			if ref, ok := r.ifaceRefOf(f); ok {
-				ref.Ctx = passesContext(pass.TypesInfo, call)
-				n.refs[ref] = true
-				return true
-			}
-			network, refs, hidden := r.imported(f)
-			if network {
-				r.local[obj] = true
-			}
-			if hidden {
-				r.hidden[obj] = true
-			}
-			for _, ref := range refs {
-				n.refs[ref] = true
-			}
+			visit(f, call)
 			return true
 		})
 	}
@@ -262,12 +278,14 @@ func runNet(pass *analysis.Pass) (any, error) {
 			r.network = true
 			continue
 		}
-		set := map[ifaceRef]bool{}
+		direct := map[ifaceRef]bool{}
 		for ref := range n.refs {
-			if len(set) < maxIfaceRefs && !r.resolve(ref) {
-				set[ref] = true
+			if !r.resolve(ref) {
+				direct[ref] = true
 			}
 		}
+		set := map[ifaceRef]bool{}
+		addRefs(set, direct)
 		unresolved[obj] = set
 		if len(set) > 0 {
 			work = append(work, obj)
@@ -277,18 +295,7 @@ func runNet(pass *analysis.Pass) (any, error) {
 		obj := work[len(work)-1]
 		work = work[:len(work)-1]
 		for _, caller := range callers[obj] {
-			set := unresolved[caller]
-			if set == nil {
-				continue
-			}
-			grew := false
-			for ref := range unresolved[obj] {
-				if len(set) < maxIfaceRefs && !set[ref] {
-					set[ref] = true
-					grew = true
-				}
-			}
-			if grew {
+			if set := unresolved[caller]; set != nil && addRefs(set, unresolved[obj]) {
 				work = append(work, caller)
 			}
 		}
@@ -298,21 +305,7 @@ func runNet(pass *analysis.Pass) (any, error) {
 		if r.local[obj] {
 			pass.ExportObjectFact(obj, &netFuncFact{Network: true})
 		} else if refs := unresolved[obj]; len(refs) > 0 || r.hidden[obj] {
-			fact := &netFuncFact{Hidden: r.hidden[obj]}
-			for ref := range refs {
-				fact.Ifaces = append(fact.Ifaces, ref)
-			}
-			sort.Slice(fact.Ifaces, func(i, j int) bool {
-				a, b := fact.Ifaces[i], fact.Ifaces[j]
-				if a.Ctx != b.Ctx {
-					return a.Ctx
-				}
-				return a.Pkg+"."+a.Type+"."+a.Method < b.Pkg+"."+b.Type+"."+b.Method
-			})
-			if len(fact.Ifaces) > maxIfaceRefs {
-				fact.Ifaces = fact.Ifaces[:maxIfaceRefs]
-			}
-			pass.ExportObjectFact(obj, fact)
+			pass.ExportObjectFact(obj, &netFuncFact{Hidden: r.hidden[obj], Ifaces: sortedRefs(refs)})
 		}
 	}
 	if !r.network {
@@ -327,6 +320,45 @@ func runNet(pass *analysis.Pass) (any, error) {
 		pass.ExportPackageFact(&netPkgFact{Network: true})
 	}
 	return r, nil
+}
+
+// addRefs adds refs to set, keeping the maxIfaceRefs that sort first so the result doesn't depend on the
+// order refs arrive in, and reports whether set changed.
+func addRefs(set, refs map[ifaceRef]bool) bool {
+	var added []ifaceRef
+	for ref := range refs {
+		if !set[ref] {
+			set[ref] = true
+			added = append(added, ref)
+		}
+	}
+	if len(set) > maxIfaceRefs {
+		for _, ref := range sortedRefs(set)[maxIfaceRefs:] {
+			delete(set, ref)
+		}
+	}
+	for _, ref := range added {
+		if set[ref] {
+			return true
+		}
+	}
+	return false
+}
+
+// sortedRefs orders refs with context-taking calls first, since only those can make a call hidden.
+func sortedRefs(refs map[ifaceRef]bool) []ifaceRef {
+	out := make([]ifaceRef, 0, len(refs))
+	for ref := range refs {
+		out = append(out, ref)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Ctx != b.Ctx {
+			return a.Ctx
+		}
+		return a.Pkg+"."+a.Type+"."+a.Method < b.Pkg+"."+b.Type+"."+b.Method
+	})
+	return out
 }
 
 // reaches reports whether calling f can reach the network.
@@ -656,6 +688,31 @@ func recvTypeName(sig *types.Signature) string {
 func asFuncLit(e ast.Expr) *ast.FuncLit {
 	lit, _ := unparen(e).(*ast.FuncLit)
 	return lit
+}
+
+// funcRef returns the function or method e names without calling it, like c.send in retry(ctx, c.send).
+func funcRef(info *types.Info, e ast.Expr) *types.Func {
+	f, _ := usedObj(info, e).(*types.Func)
+	return f
+}
+
+func usedObj(info *types.Info, e ast.Expr) types.Object {
+	switch x := unparen(e).(type) {
+	case *ast.Ident:
+		return info.Uses[x]
+	case *ast.SelectorExpr:
+		return info.Uses[x.Sel]
+	}
+	return nil
+}
+
+func isFuncValue(info *types.Info, e ast.Expr) bool {
+	t := info.TypeOf(e)
+	if t == nil {
+		return false
+	}
+	_, ok := t.Underlying().(*types.Signature)
+	return ok
 }
 
 // isBufferedConnIO matches a read or write on a bufio.Reader or Writer kept in a struct field, which is

@@ -1,9 +1,13 @@
 package rules
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 
 	"gopkg.in/yaml.v3"
@@ -55,7 +59,7 @@ var (
 )
 
 func defaultConfig() *Config {
-	return &Config{HelperDepth: 3, DisconnectEvents: DefaultDisconnectEvents}
+	return &Config{HelperDepth: 3, DisconnectEvents: maps.Clone(DefaultDisconnectEvents)}
 }
 
 func LoadConfig(dir string) (*Config, error) {
@@ -70,11 +74,7 @@ func LoadConfig(dir string) (*Config, error) {
 	}
 	cfg := defaultConfig()
 	if path != "" {
-		data, err := os.ReadFile(path)
-		if err == nil {
-			err = yaml.Unmarshal(data, cfg)
-		}
-		if err != nil {
+		if err := readConfig(path, cfg); err != nil {
 			err = fmt.Errorf("reading %s: %w", path, err)
 			configCache[path], configErrs[path] = cfg, err
 			return cfg, err
@@ -83,7 +83,7 @@ func LoadConfig(dir string) (*Config, error) {
 			cfg.HelperDepth = 3
 		}
 		if cfg.DisconnectEvents == nil {
-			cfg.DisconnectEvents = DefaultDisconnectEvents
+			cfg.DisconnectEvents = maps.Clone(DefaultDisconnectEvents)
 		}
 	}
 	cfg.disabledSet = map[string]struct{}{}
@@ -92,6 +92,35 @@ func LoadConfig(dir string) (*Config, error) {
 	}
 	configCache[path] = cfg
 	return cfg, nil
+}
+
+// readConfig decodes the file at path into cfg. Unknown keys, rule IDs and severities are errors, so a
+// typo can't silently leave a rule as it was.
+func readConfig(path string, cfg *Config) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	dec := yaml.NewDecoder(f)
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	for _, id := range cfg.Disable {
+		if _, ok := Rules[id]; !ok {
+			return fmt.Errorf("disable: unknown rule %s", id)
+		}
+	}
+	for _, id := range slices.Sorted(maps.Keys(cfg.Severity)) {
+		if _, ok := Rules[id]; !ok {
+			return fmt.Errorf("severity: unknown rule %s", id)
+		}
+		if _, ok := ParseSeverity(cfg.Severity[id]); !ok {
+			return fmt.Errorf("severity: %s for %s must be error, warning or info", cfg.Severity[id], id)
+		}
+	}
+	return nil
 }
 
 func findConfig(dir string) string {

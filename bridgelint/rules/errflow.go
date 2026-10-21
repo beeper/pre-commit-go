@@ -19,6 +19,7 @@ const (
 	errConstructed                // errors.New or fmt.Errorf without wrapping anything typed
 	errRaw                        // returned unchanged from a network or library call
 	errJoin                       // errors.Join
+	errInternal                   // from a call that can't reach the network; never reported
 )
 
 type errOrigin struct {
@@ -33,6 +34,8 @@ type errOrigin struct {
 	calleePkg, calleeFn string
 	// via names the function in another package of the module that the error came through.
 	via string
+	// partial is set when some of the returns the origin was picked from couldn't be classified.
+	partial bool
 }
 
 func (o errOrigin) hasCallee() bool {
@@ -55,6 +58,22 @@ func (o errOrigin) calleeFuncName() string {
 
 func (o errOrigin) bad() bool {
 	return o.kind == errConstructed || o.kind == errRaw || o.kind == errJoin
+}
+
+// severity ranks bad origins for picking the one a function reports: a raw network error, then a plain
+// error wrapping one, then one that formats an error or status code into its text, then the rest.
+func (o errOrigin) severity() int {
+	switch {
+	case o.kind == errRaw:
+		return 4
+	case o.kind == errConstructed && o.hasCallee():
+		return 3
+	case o.bad() && o.formatsErr:
+		return 2
+	case o.bad():
+		return 1
+	}
+	return 0
 }
 
 type errFlow struct {
@@ -107,8 +126,11 @@ func (ef *errFlow) returnedErrors(fn ast.Node, idx int, cb func(ret *ast.ReturnS
 
 func (ef *errFlow) originOfReturn(fn ast.Node, ret *ast.ReturnStmt, idx, depth int) errOrigin {
 	sig := funcType(ef.info, fn)
-	if sig == nil || ef.rewrittenByDefer(fn, sig, idx) {
+	if sig == nil {
 		return errOrigin{}
+	}
+	if ef.rewrittenByDefer(fn, sig, idx) {
+		return errOrigin{kind: errGood}
 	}
 	switch {
 	case len(ret.Results) == sig.Results().Len() && idx < len(ret.Results):
@@ -484,7 +506,7 @@ func (ef *errFlow) classifyCall(fn ast.Node, call *ast.CallExpr, idx, depth int)
 	if ef.net.mightReach(f, false) {
 		return errOrigin{kind: errRaw, node: call, callee: f}
 	}
-	return errOrigin{}
+	return errOrigin{kind: errInternal}
 }
 
 // funcOrigin returns the worst error that fd, a function in this package, can return as result idx.
@@ -495,13 +517,17 @@ func (ef *errFlow) funcOrigin(fd *ast.FuncDecl, idx, depth int) errOrigin {
 	ef.visiting[fd] = true
 	defer delete(ef.visiting, fd)
 	var worst errOrigin
+	partial := false
 	inspectFunc(fd.Body, func(n ast.Node) bool {
 		ret, ok := n.(*ast.ReturnStmt)
 		if !ok {
 			return true
 		}
 		o := ef.originOfReturn(fd, ret, idx, depth-1)
-		if o.bad() && (!worst.bad() || o.kind == errRaw && worst.kind != errRaw) {
+		if o.kind == errUnknown || o.partial {
+			partial = true
+		}
+		if o.severity() > worst.severity() {
 			worst = o
 			if worst.helper == nil && worst.via == "" {
 				worst.helper = fd
@@ -509,6 +535,10 @@ func (ef *errFlow) funcOrigin(fd *ast.FuncDecl, idx, depth int) errOrigin {
 		}
 		return true
 	})
+	if worst.kind == errUnknown && !partial {
+		worst.kind = errInternal
+	}
+	worst.partial = partial
 	return worst
 }
 
@@ -566,8 +596,9 @@ func (ef *errFlow) classifyErrorf(fn ast.Node, call *ast.CallExpr, depth int) er
 		}
 		inner := ef.classify(fn, call.Args[argIdx+1], at, depth)
 		if !inner.bad() {
-			return errOrigin{kind: inner.kind, formatsErr: o.formatsErr}
+			return errOrigin{kind: inner.kind, formatsErr: o.formatsErr, partial: inner.partial}
 		}
+		o.partial = o.partial || inner.partial
 		if inner.kind == errRaw {
 			o.callee, o.calleePkg, o.calleeFn, o.via = inner.callee, inner.calleePkg, inner.calleeFn, inner.via
 		}

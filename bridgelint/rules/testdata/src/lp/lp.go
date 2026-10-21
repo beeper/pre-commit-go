@@ -79,6 +79,9 @@ func (t *TokenLogin) SubmitUserInput(ctx context.Context, input map[string]strin
 	if !tokenRegex.MatchString(input["token"]) { // want `LP008: this check duplicates the Pattern on the login field`
 		return nil, ErrInvalidToken
 	}
+	if !(tokenRegex.MatchString)(input["token"]) { // want `LP008: this check duplicates the Pattern on the login field`
+		return nil, ErrInvalidToken
+	}
 	return nil, nil
 }
 
@@ -97,9 +100,27 @@ var (
 	ErrLimit2        = mautrix.MLimitExceeded.WithStatus(429)                              // want `LP002: RespError is sent as HTTP 429`
 	ErrLimit3        = bridgev2.RespError(mautrix.MLimitExceeded.WithMessage("Slow down")) // want `LP002: mautrix.MLimitExceeded is sent as HTTP 429 by default`
 	ErrLimit4        = mautrix.MLimitExceeded.WithMessage("Slow down").WithStatus(http.StatusBadRequest)
+	ErrLimit5        = mautrix.RespError{ErrCode: "M_LIMIT_EXCEEDED", Err: "Slow down"} // want `LP005: RespError literal without StatusCode` `LP007: RespError literal for M_LIMIT_EXCEEDED`
 )
 
 func isLimit(err error) bool { return errors.Is(err, mautrix.MLimitExceeded) }
+
+// The fix for a pointer literal would take the address of a call, so it's reported without one.
+var ErrForbiddenPtr = &mautrix.RespError{ErrCode: "M_FORBIDDEN", Err: "Not allowed", StatusCode: 403} // want `LP007: RespError literal for M_FORBIDDEN`
+
+// A JSON body's StatusCode isn't sent: the writer is given the status.
+func writeConflict(w http.ResponseWriter) {
+	writeJSON(w, http.StatusConflict, mautrix.RespError{ErrCode: "FI.MAU.EX.CONFLICT", Err: "conflict"})
+	writeJSON(w, http.StatusConflict, &mautrix.RespError{ErrCode: "FI.MAU.EX.CONFLICT", Err: "conflict"})
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {}
+
+func wrapConflict() error {
+	return wrapErr(mautrix.RespError{ErrCode: "FI.MAU.EX.CONFLICT", Err: "conflict"}) // want `LP005: RespError literal without StatusCode`
+}
+
+func wrapErr(err error) error { return err }
 
 func passthrough(err error) error {
 	var te *netlib.APIError

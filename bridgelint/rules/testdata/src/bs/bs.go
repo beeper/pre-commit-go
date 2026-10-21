@@ -107,6 +107,24 @@ func (c *Client) authCheckSentinel(err error) {
 	}
 }
 
+// A negated check guards its else branch, not its body.
+func (c *Client) notAuthCheck(statusCode int, err error) {
+	if statusCode != 401 {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "ex-net", Message: "x"})
+	}
+	if !errors.Is(err, netlib.ErrUnauthorized) {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "ex-net", Message: "x"})
+	} else {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "ex-session-gone", Message: "x"}) // want `BS010: TRANSIENT_DISCONNECT under an auth check`
+	}
+	if statusCode == 401 || statusCode == 403 {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "ex-unauthorized", Message: "x"}) // want `BS010: TRANSIENT_DISCONNECT under an auth check`
+	}
+	if statusCode == 401 || statusCode == 429 {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "ex-net", Message: "x"})
+	}
+}
+
 // A status that isn't 401 or 403 says nothing about the session.
 func (c *Client) rateLimitCheck(resp *http.Response) {
 	if resp.StatusCode == http.StatusTooManyRequests {
@@ -141,6 +159,30 @@ func (c *Client) elseCatchAll(ctx context.Context) {
 	} else {
 		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "ex-invalid-auth"}) // want `BS011: BAD_CREDENTIALS sent for every connect error`
 	}
+}
+
+type connEvent struct {
+	LoggedOut bool
+	Err       error
+}
+
+// A nil check on an error the library handed over doesn't classify anything: both branches are already
+// known to be a logout.
+func (c *Client) loggedOutEvent(evt connEvent) {
+	err := evt.Err
+	if !evt.LoggedOut {
+		return
+	}
+	if err == nil {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "ex-logged-out", Message: "logged out"})
+	} else {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "ex-logged-out", Message: "logged out"})
+	}
+}
+
+// LOGGED_OUT means the user logged out on purpose, so it isn't an error state that needs a code.
+func (c *Client) logout() {
+	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateLoggedOut})
 }
 
 func (c *Client) catchAll(ctx context.Context) {

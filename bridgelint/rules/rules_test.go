@@ -1,7 +1,9 @@
 package rules
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/analysis/analysistest"
@@ -14,7 +16,7 @@ func TestMSS(t *testing.T) {
 func TestBS(t *testing.T) {
 	MautrixVersion = "local"
 	defer func() { MautrixVersion = "" }()
-	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), BSAnalyzer, "bs")
+	analysistest.Run(t, analysistest.TestData(), BSAnalyzer, "bs")
 }
 
 func TestFrameworkHas(t *testing.T) {
@@ -26,6 +28,9 @@ func TestFrameworkHas(t *testing.T) {
 		"v0.33.0":                               true,
 		"v0.32.1-0.20261017155816-789c6d4faeb3": false,
 		"v0.32.1-0.20261019120000-0123456789ab": true,
+		"local@2026-10-19T00:49:15+03:00":       false,
+		"local@2026-10-20T09:00:00Z":            true,
+		"local@unreadable":                      true,
 	}
 	for v, want := range cases {
 		MautrixVersion = v
@@ -34,6 +39,48 @@ func TestFrameworkHas(t *testing.T) {
 		}
 	}
 	MautrixVersion = ""
+}
+
+func TestConfigValidation(t *testing.T) {
+	cases := map[string]string{
+		"":                           "",
+		"status_mapper: [wrapErr]\n": "field status_mapper not found",
+		"disable: [GR012]\n":         "disable: unknown rule GR012",
+		"severity: {XX001: info}\n":  "severity: unknown rule XX001",
+		"severity: {MSS001: warn}\n": "severity: warn for MSS001 must be error, warning or info",
+	}
+	defer func() { ConfigOverride = "" }()
+	for content, want := range cases {
+		ConfigOverride = filepath.Join(t.TempDir(), ConfigFileName)
+		if err := os.WriteFile(ConfigOverride, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadConfig("")
+		switch {
+		case want == "" && err != nil:
+			t.Errorf("config %q: unexpected error %v", content, err)
+		case want != "" && (err == nil || !strings.Contains(err.Error(), want)):
+			t.Errorf("config %q: error %v, want %q", content, err, want)
+		}
+	}
+}
+
+func TestDisconnectEventsAddToDefaults(t *testing.T) {
+	defer func() { ConfigOverride = "" }()
+	ConfigOverride = filepath.Join(t.TempDir(), ConfigFileName)
+	if err := os.WriteFile(ConfigOverride, []byte("disconnect_events:\n  example.com/lib: [\"*Gone\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.DisconnectEvents) != len(DefaultDisconnectEvents)+1 {
+		t.Errorf("disconnect events = %v, want the defaults plus example.com/lib", cfg.DisconnectEvents)
+	}
+	if _, ok := DefaultDisconnectEvents["example.com/lib"]; ok {
+		t.Error("loading a config changed DefaultDisconnectEvents")
+	}
 }
 
 // TestCrossPackage runs in module mode, where errors are followed into other packages of the module.
@@ -46,7 +93,7 @@ func TestLP(t *testing.T) {
 }
 
 func TestEP(t *testing.T) {
-	analysistest.Run(t, analysistest.TestData(), EPAnalyzer, "ep", "epnetlib")
+	analysistest.Run(t, analysistest.TestData(), EPAnalyzer, "ep", "epnetlib", "epmain")
 }
 
 func TestGR(t *testing.T) {

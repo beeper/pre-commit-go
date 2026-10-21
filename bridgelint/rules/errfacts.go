@@ -19,11 +19,14 @@ type errSummary struct {
 	CalleeName string // function name of the raw origin, for messages
 	FormatsErr bool
 	Statuses   bool // the function returns bridgev2 statuses itself, so its errors are meant for the bridge
+	// Complete is set when every error the function returns was classified, so Kind says everything it
+	// can return.
+	Complete bool
 }
 
 func (s errSummary) String() string {
 	kind := map[errKind]string{errConstructed: "constructed", errRaw: "raw", errJoin: "join"}[s.Kind]
-	return fmt.Sprintf("%s msg=%q callee=%s.%s statuses=%t", kind, s.Msg, s.CalleePkg, s.CalleeName, s.Statuses)
+	return fmt.Sprintf("%s msg=%q callee=%s.%s statuses=%t complete=%t", kind, s.Msg, s.CalleePkg, s.CalleeName, s.Statuses, s.Complete)
 }
 
 // Each analyzer needs its own fact type: go/analysis doesn't allow two analyzers to register the same one.
@@ -53,7 +56,7 @@ func newLPFact() errFact  { return new(lpErrFact) }
 func newBSFact() errFact  { return new(bsErrFact) }
 
 // withFacts makes ef import summaries for functions in other packages of the module, and exports
-// summaries for every function in this package that returns an error or reaches the network.
+// summaries for every function in this package that returns an error.
 func (ef *errFlow) withFacts(pass *analysis.Pass, newFact func() errFact) *errFlow {
 	ef.factPass = pass
 	ef.newFact = newFact
@@ -64,19 +67,23 @@ func (ef *errFlow) withFacts(pass *analysis.Pass, newFact func() errFact) *errFl
 		return ef
 	}
 	for obj, fd := range ef.pi.decls {
+		sig, _ := obj.Type().(*types.Signature)
+		idx := errorResultIndex(sig)
+		if idx < 0 {
+			continue
+		}
 		fact := newFact()
 		s := fact.summary()
-		s.Statuses = ef.returnsStatuses(fd)
-		if sig, ok := obj.Type().(*types.Signature); ok {
-			if idx := errorResultIndex(sig); idx >= 0 {
-				o := ef.funcOrigin(fd, idx, ef.cfg.HelperDepth)
-				if o.bad() {
-					s.Kind, s.Msg, s.FormatsErr = o.kind, o.msg, o.formatsErr
-					s.CalleePkg, s.CalleeName = o.calleePkgName(), o.calleeFuncName()
-				}
-			}
+		s.Statuses = ef.returnsStatuses(fd, sig, idx)
+		o := ef.funcOrigin(fd, idx, ef.cfg.HelperDepth)
+		if o.bad() {
+			s.Kind, s.Msg, s.FormatsErr = o.kind, o.msg, o.formatsErr
+			s.CalleePkg, s.CalleeName = o.calleePkgName(), o.calleeFuncName()
 		}
-		if s.Kind != errUnknown || s.Statuses {
+		s.Complete = o.kind != errUnknown && !o.partial
+		// A complete summary only changes anything for a function that reaches the network: the rest
+		// can't return a network error either way.
+		if s.Kind != errUnknown || s.Statuses || s.Complete && ef.net.mightReach(obj, true) {
 			pass.ExportObjectFact(obj, fact)
 		}
 	}
@@ -85,15 +92,7 @@ func (ef *errFlow) withFacts(pass *analysis.Pass, newFact func() errFact) *errFl
 
 // returnsStatuses reports whether fd itself returns bridgev2 message statuses or RespErrors (directly,
 // or wrapped with fmt.Errorf), like a message converter does.
-func (ef *errFlow) returnsStatuses(fd *ast.FuncDecl) bool {
-	sig, ok := ef.info.Defs[fd.Name].Type().(*types.Signature)
-	if !ok {
-		return false
-	}
-	idx := errorResultIndex(sig)
-	if idx < 0 {
-		return false
-	}
+func (ef *errFlow) returnsStatuses(fd *ast.FuncDecl, sig *types.Signature, idx int) bool {
 	found := false
 	inspectFunc(fd.Body, func(n ast.Node) bool {
 		ret, ok := n.(*ast.ReturnStmt)
@@ -150,20 +149,32 @@ func (ef *errFlow) importedOrigin(f *types.Func, call *ast.CallExpr) errOrigin {
 		if ef.net.mightReach(f, true) {
 			return errOrigin{kind: errRaw, node: call, callee: f}
 		}
-		return errOrigin{}
+		return errOrigin{kind: errInternal}
 	}
 	s := fact.summary()
 	if !s.Statuses {
 		// A library function: any network error escaping it is a library error as far as the bridge is
 		// concerned, even if the library wrapped it or built it itself. Errors the library builds without
-		// touching the network are internal invariants.
-		if ef.net.mightReach(f, true) || s.Kind == errRaw || s.Kind == errConstructed && s.CalleeName != "" {
+		// touching the network are internal invariants, and so are the fixed errors of a function whose
+		// returns are all accounted for, like a converter that logs a failed upload and returns
+		// ErrUploadFailed.
+		switch {
+		case s.Kind == errRaw, s.Kind == errConstructed && s.CalleeName != "":
+			return errOrigin{kind: errRaw, node: call, callee: f}
+		case s.Complete && !s.FormatsErr:
+			return errOrigin{kind: errInternal}
+		case ef.net.mightReach(f, true):
 			return errOrigin{kind: errRaw, node: call, callee: f}
 		}
-		return errOrigin{}
+		return errOrigin{kind: errInternal}
+	}
+	kind := s.Kind
+	if kind == errUnknown && s.Complete {
+		kind = errInternal
 	}
 	return errOrigin{
-		kind:       s.Kind,
+		kind:       kind,
+		partial:    !s.Complete,
 		node:       call,
 		msg:        s.Msg,
 		calleePkg:  s.CalleePkg,

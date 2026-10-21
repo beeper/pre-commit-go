@@ -13,6 +13,19 @@ func check(resp *http.Response) error {
 	return nil
 }
 
+// An API's own Response type isn't an HTTP response.
+type Response struct {
+	Status string
+	Error  string
+}
+
+func checkAPI(r *Response) error {
+	if r.Status != "ok" {
+		return fmt.Errorf("api error: %s", r.Status)
+	}
+	return nil
+}
+
 type reply struct{ Status int }
 
 func checkReply(r reply) error {

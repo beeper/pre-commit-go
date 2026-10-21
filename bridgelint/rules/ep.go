@@ -47,7 +47,7 @@ func runEP(pass *analysis.Pass) (any, error) {
 				if isPkgFunc(obj, "strings", "EqualFold") && len(x.Args) > 0 && isErrText(x.Args[0]) {
 					report(pass, x, EP001, "error matched with strings.EqualFold(err.Error(), ...); use errors.Is/errors.As or a typed code accessor")
 				}
-				if !pi.isBridge && isPkgFunc(obj, "fmt", "Errorf") {
+				if !pi.isBridge && pass.Pkg.Name() != "main" && isPkgFunc(obj, "fmt", "Errorf") {
 					checkUntypedHTTPError(pass, x)
 				}
 			case *ast.KeyValueExpr:

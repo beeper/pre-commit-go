@@ -52,7 +52,7 @@ var (
 	MSS006 = rule("MSS006", SeverityWarning, "the bridge has an error classifier but the handler doesn't use it")
 
 	BS001 = rule("BS001", SeverityInfo, "explicit RELOGIN is redundant")
-	BS002 = rule("BS002", SeverityError, "restriction or ban sent with the wrong state or action")
+	BS002 = rule("BS002", SeverityWarning, "restriction or ban sent with the wrong state or action")
 	BS003 = rule("BS003", SeverityError, "raw error text in bridge state Message")
 	BS004 = rule("BS004", SeverityError, "error state without a stable code")
 	BS005 = rule("BS005", SeverityWarning, "bridge state code without a human message")

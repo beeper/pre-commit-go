@@ -23,9 +23,16 @@ type Client struct {
 	meta    *Meta
 	cache   map[string]string
 	pending map[string]bool
+
+	reconnectAttempts int
 }
 
-type Meta struct{ Cursor string }
+type Meta struct {
+	Cursor     string
+	LastPts    int
+	LastSeq    int
+	Subsequent bool
+}
 
 var _ bridgev2.NetworkAPI = (*Client)(nil)
 
@@ -126,6 +133,10 @@ func (c *Client) sync(ctx context.Context) {
 		c.br.QueueRemoteEvent(c.login, item)
 	}
 	c.meta.Cursor = "next" // want `GR008: Cursor is saved after queueing remote events`
+	c.meta.LastPts = 5     // want `GR008: LastPts is saved after queueing remote events`
+	c.reconnectAttempts = 0
+	c.meta.LastSeq = 1 // want `GR008: LastSeq is saved after queueing remote events`
+	c.meta.Subsequent = true
 }
 
 func (c *Client) remember(k string) {

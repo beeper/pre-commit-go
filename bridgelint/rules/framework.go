@@ -1,6 +1,7 @@
 package rules
 
 import (
+	"strings"
 	"time"
 
 	"golang.org/x/mod/module"
@@ -22,7 +23,8 @@ var (
 )
 
 // MautrixVersion is the maunium.net/go/mautrix version of the module being linted, set by the driver.
-// "local" means a filesystem replace, assumed to be a recent checkout. Empty means unknown.
+// "local@<RFC 3339 time>" is a local checkout whose git HEAD was committed then; plain "local" is one
+// whose HEAD couldn't be read, assumed to be recent. Empty means unknown.
 var MautrixVersion string
 
 // FrameworkHas reports whether the linted module's mautrix includes f. Unknown versions report false,
@@ -32,6 +34,9 @@ func FrameworkHas(f Feature) bool {
 	switch {
 	case v == "local":
 		return true
+	case strings.HasPrefix(v, "local@"):
+		t, err := time.Parse(time.RFC3339, strings.TrimPrefix(v, "local@"))
+		return err != nil || !t.Before(f.Since)
 	case v == "" || !semver.IsValid(v):
 		return false
 	case module.IsPseudoVersion(v):

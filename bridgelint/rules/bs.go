@@ -212,7 +212,7 @@ func mergeLaterAssignments(pass *analysis.Pass, pi *pkgInfo, sl *stateLit) {
 func checkStateLit(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, sl *stateLit, keys map[string]bool, codeShape *regexp.Regexp) {
 	info := pass.TypesInfo
 	lit := sl.lit
-	isErrorState := sl.event != "" && !slices.Contains([]string{"CONNECTED", "CONNECTING", "BACKFILLING", "STARTING", "RUNNING", "UNCONFIGURED"}, sl.event)
+	isErrorState := sl.event != "" && !slices.Contains([]string{"CONNECTED", "CONNECTING", "BACKFILLING", "STARTING", "RUNNING", "UNCONFIGURED", "LOGGED_OUT"}, sl.event)
 
 	// BS001
 	if sl.event == "BAD_CREDENTIALS" && sl.action == "RELOGIN" && FrameworkHas(FeatureReloginDefault) {
@@ -293,6 +293,19 @@ func condUsesError(info *types.Info, cond ast.Expr) bool {
 	return found
 }
 
+// isNilCheck reports whether cond only compares an error with nil, which separates success from failure
+// without telling errors apart.
+func isNilCheck(info *types.Info, cond ast.Expr) bool {
+	be, ok := unparen(cond).(*ast.BinaryExpr)
+	return ok && (be.Op == token.EQL || be.Op == token.NEQ) && isErrorType(info.TypeOf(be.X)) && info.Types[be.Y].IsNil()
+}
+
+// comparesRawError reports whether cond is `err <op> ...` on an error returned unchanged by a network call.
+func comparesRawError(pass *analysis.Pass, ef *errFlow, sl *stateLit, cond ast.Expr, op token.Token, at token.Pos) bool {
+	be, ok := unparen(cond).(*ast.BinaryExpr)
+	return ok && be.Op == op && isErrorInterface(pass.TypesInfo.TypeOf(be.X)) && ef.classify(sl.fn, be.X, at, 0).kind == errRaw
+}
+
 func describeState(sl *stateLit) string {
 	if sl.action != "" {
 		return sl.event + " with " + sl.action
@@ -335,73 +348,107 @@ func isEmptyString(info *types.Info, e ast.Expr) bool {
 	return ok && s == ""
 }
 
-// enclosingConds returns the conditions n is reached under: the condition of every if statement whose
-// body contains it, and the expressions of every case clause it sits in.
-func enclosingConds(pi *pkgInfo, n ast.Node) []ast.Expr {
-	var conds []ast.Expr
-	for p := pi.parents[n]; p != nil; p = pi.parents[p] {
-		switch x := p.(type) {
-		case *ast.FuncDecl, *ast.FuncLit:
-			return conds
-		case *ast.IfStmt:
-			if containsNode(x.Body, n) {
-				conds = append(conds, x.Cond)
-			}
-		case *ast.CaseClause:
-			conds = append(conds, x.List...)
-		}
-	}
-	return conds
-}
-
 // authGuarded reports whether n is only reached when the code has established that the session was
-// rejected.
+// rejected: it's in the branch of an if, or the case of a tagless switch, whose condition implies it.
 func authGuarded(pass *analysis.Pass, pi *pkgInfo, cfg *Config, n ast.Node) bool {
 	if n == nil {
 		return false
 	}
-	for _, cond := range enclosingConds(pi, n) {
-		if condChecksAuth(pass, cfg, cond) {
-			return true
+	for p := pi.parents[n]; p != nil; p = pi.parents[p] {
+		switch x := p.(type) {
+		case *ast.FuncDecl, *ast.FuncLit:
+			return false
+		case *ast.IfStmt:
+			if containsNode(x.Body, n) && condImpliesAuth(pass, cfg, x.Cond, true) {
+				return true
+			}
+			if x.Else != nil && containsNode(x.Else, n) && condImpliesAuth(pass, cfg, x.Cond, false) {
+				return true
+			}
+		case *ast.CaseClause:
+			if caseImpliesAuth(pass, pi, cfg, x) {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// condChecksAuth reports whether cond tests for a rejected session: a comparison against HTTP 401 or
-// 403, or errors.Is/As against one of the configured auth_errors.
+// caseImpliesAuth reports whether every expression of a tagless switch case implies a rejected session.
+func caseImpliesAuth(pass *analysis.Pass, pi *pkgInfo, cfg *Config, cc *ast.CaseClause) bool {
+	sw, ok := pi.parents[pi.parents[cc]].(*ast.SwitchStmt)
+	if !ok || sw.Tag != nil || len(cc.List) == 0 {
+		return false
+	}
+	for _, e := range cc.List {
+		if !condImpliesAuth(pass, cfg, e, true) {
+			return false
+		}
+	}
+	return true
+}
+
+// condImpliesAuth reports whether cond evaluating to want means the session was rejected, so that
+// `code != 401` and `!errors.Is(err, ErrAuth)` guard their else branch rather than their body.
+func condImpliesAuth(pass *analysis.Pass, cfg *Config, cond ast.Expr, want bool) bool {
+	switch x := unparen(cond).(type) {
+	case *ast.UnaryExpr:
+		return x.Op == token.NOT && condImpliesAuth(pass, cfg, x.X, !want)
+	case *ast.BinaryExpr:
+		switch {
+		case x.Op == token.LAND && want, x.Op == token.LOR && !want:
+			return condImpliesAuth(pass, cfg, x.X, want) || condImpliesAuth(pass, cfg, x.Y, want)
+		case x.Op == token.LOR && want, x.Op == token.LAND && !want:
+			return condImpliesAuth(pass, cfg, x.X, want) && condImpliesAuth(pass, cfg, x.Y, want)
+		case x.Op == token.EQL, x.Op == token.NEQ:
+			return (x.Op == token.EQL) == want && (isAuthStatus(pass.TypesInfo, x.X) || isAuthStatus(pass.TypesInfo, x.Y))
+		}
+	case *ast.CallExpr:
+		return want && isAuthErrorCheck(pass, cfg, x)
+	}
+	return false
+}
+
+// condChecksAuth reports whether cond tests for a rejected session either way: a comparison against
+// HTTP 401 or 403, or errors.Is/As against one of the configured auth_errors.
 func condChecksAuth(pass *analysis.Pass, cfg *Config, cond ast.Expr) bool {
-	info := pass.TypesInfo
 	found := false
 	ast.Inspect(cond, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.BinaryExpr:
-			if x.Op != token.EQL && x.Op != token.NEQ {
-				return true
-			}
-			for _, side := range []ast.Expr{x.X, x.Y} {
-				if v, ok := constInt(info, side); ok && (v == 401 || v == 403) {
-					found = true
-				}
+			if (x.Op == token.EQL || x.Op == token.NEQ) && (isAuthStatus(pass.TypesInfo, x.X) || isAuthStatus(pass.TypesInfo, x.Y)) {
+				found = true
 			}
 		case *ast.CallExpr:
-			if !isPkgFunc(calleeObj(info, x), "errors", "Is", "As") || len(x.Args) != 2 {
-				return true
-			}
-			target := unparen(x.Args[1])
-			if u, ok := target.(*ast.UnaryExpr); ok && u.Op == token.AND {
-				target = unparen(u.X)
-			}
-			if sel, ok := target.(*ast.SelectorExpr); ok {
-				target = sel.Sel
-			}
-			if id, ok := target.(*ast.Ident); ok && matchesQualified(info.Uses[id], cfg.AuthErrors) {
+			if isAuthErrorCheck(pass, cfg, x) {
 				found = true
 			}
 		}
 		return !found
 	})
 	return found
+}
+
+func isAuthStatus(info *types.Info, e ast.Expr) bool {
+	v, ok := constInt(info, e)
+	return ok && (v == 401 || v == 403)
+}
+
+// isAuthErrorCheck matches errors.Is/As against one of the configured auth_errors.
+func isAuthErrorCheck(pass *analysis.Pass, cfg *Config, call *ast.CallExpr) bool {
+	info := pass.TypesInfo
+	if !isPkgFunc(calleeObj(info, call), "errors", "Is", "As") || len(call.Args) != 2 {
+		return false
+	}
+	target := unparen(call.Args[1])
+	if u, ok := target.(*ast.UnaryExpr); ok && u.Op == token.AND {
+		target = unparen(u.X)
+	}
+	if sel, ok := target.(*ast.SelectorExpr); ok {
+		target = sel.Sel
+	}
+	id, ok := target.(*ast.Ident)
+	return ok && matchesQualified(info.Uses[id], cfg.AuthErrors)
 }
 
 // matchesQualified reports whether obj is named by one of names, each either a bare name or
@@ -411,16 +458,14 @@ func matchesQualified(obj types.Object, names []string) bool {
 		return false
 	}
 	for _, want := range names {
-		pkg, name, qualified := strings.Cut(want, ".")
-		if !qualified {
+		i := strings.LastIndexByte(want, '.')
+		if i < 0 {
 			if obj.Name() == want {
 				return true
 			}
 			continue
 		}
-		if i := strings.LastIndexByte(want, '.'); i >= 0 {
-			pkg, name = want[:i], want[i+1:]
-		}
+		pkg, name := want[:i], want[i+1:]
 		if obj.Name() == name && obj.Pkg() != nil && (obj.Pkg().Path() == pkg || obj.Pkg().Name() == pkg) {
 			return true
 		}
@@ -438,7 +483,8 @@ func nodeText(pass *analysis.Pass, n ast.Node) string {
 	return string(data[start.Offset:end.Offset])
 }
 
-// isCatchAllAuth reports BAD_CREDENTIALS in a default/else branch, or directly under `if err != nil` after a connect call.
+// isCatchAllAuth reports BAD_CREDENTIALS in a default/else branch, or for any error from a connect call:
+// directly under `if err != nil`, or in the else of `if err == nil`.
 func isCatchAllAuth(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, sl *stateLit) bool {
 	var child ast.Node = sl.lit
 	for p := pi.parents[sl.lit]; p != nil; child, p = p, pi.parents[p] {
@@ -467,16 +513,16 @@ func isCatchAllAuth(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, 
 			return mentionsErr
 		case *ast.IfStmt:
 			if x.Else == child {
-				_, isBlock := x.Else.(*ast.BlockStmt)
-				return isBlock && condUsesError(pass.TypesInfo, x.Cond) && !condChecksAuth(pass, cfg, x.Cond)
+				if _, isBlock := x.Else.(*ast.BlockStmt); !isBlock {
+					return false
+				}
+				if isNilCheck(pass.TypesInfo, x.Cond) {
+					return comparesRawError(pass, ef, sl, x.Cond, token.EQL, x.Else.Pos())
+				}
+				return condUsesError(pass.TypesInfo, x.Cond) && !condChecksAuth(pass, cfg, x.Cond)
 			}
 			if containsNode(x.Body, sl.lit) {
-				if be, ok := x.Cond.(*ast.BinaryExpr); ok && be.Op == token.NEQ && isErrorInterface(pass.TypesInfo.TypeOf(be.X)) {
-					if o := ef.classify(sl.fn, be.X, x.Body.Pos(), 0); o.kind == errRaw {
-						return true
-					}
-				}
-				return false
+				return comparesRawError(pass, ef, sl, x.Cond, token.NEQ, x.Body.Pos())
 			}
 		}
 	}

@@ -20,7 +20,9 @@ var MSSAnalyzer = &analysis.Analyzer{
 	FactTypes: []analysis.Fact{new(mssErrFact)},
 }
 
-var classifierNameRegex = regexp.MustCompile(`(?i)(code|kind|class|reason|status)`)
+// classifierNameRegex matches names with Code, Kind, Class, Reason or Status as a camelCase word, so
+// codeOf and slackErrorCode match but decodeError doesn't.
+var classifierNameRegex = regexp.MustCompile(`^(code|kind|class|reason|status)|Code|Kind|Class|Reason|Status`)
 
 var permanentReasons = map[string]bool{
 	"MessageStatusUnsupported":  true,
@@ -271,7 +273,7 @@ func checkBlockingSends(pass *analysis.Pass, fd *ast.FuncDecl) {
 					return true
 				}
 			}
-			if hasCtxDoneCase(pi, parent) {
+			if hasReceiveCase(pi, parent) {
 				return true
 			}
 		}
@@ -291,7 +293,9 @@ func selectHasDefault(ss *ast.SelectStmt) bool {
 	return false
 }
 
-func hasCtxDoneCase(pi *pkgInfo, cc *ast.CommClause) bool {
+// hasReceiveCase reports whether the select around cc also waits on a receive, like ctx.Done(), a timer
+// or a stop channel, so the send gives up instead of blocking forever.
+func hasReceiveCase(pi *pkgInfo, cc *ast.CommClause) bool {
 	block, ok := pi.parents[cc].(*ast.BlockStmt)
 	if !ok {
 		return false
@@ -301,14 +305,7 @@ func hasCtxDoneCase(pi *pkgInfo, cc *ast.CommClause) bool {
 		if !ok || other == cc || other.Comm == nil {
 			continue
 		}
-		found := false
-		ast.Inspect(other.Comm, func(n ast.Node) bool {
-			if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "Done" {
-				found = true
-			}
-			return !found
-		})
-		if found {
+		if _, isSend := other.Comm.(*ast.SendStmt); !isSend {
 			return true
 		}
 	}
