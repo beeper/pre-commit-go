@@ -161,7 +161,7 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 | Rule | Severity | Flags |
 |---|---|---|
 | MSS001 | error | A handler returns a network error unmapped: as is, or wrapped in `fmt.Errorf`, directly or through a same-package helper. |
-| MSS002 | error | A permanent rejection stays retriable: `ErrorReason` `Unsupported`/`NoPermission`/`TooOld` without `WithStatus(event.MessageStatusFail)`. |
+| MSS002 | error | A permanent rejection stays retriable: `ErrorReason` `Unsupported`/`NoPermission` without `WithStatus(event.MessageStatusFail)`. |
 | MSS003 | warning | Raw error text shown to users: `WithErrorAsMessage()` on a library error or on `fmt.Errorf` that formats another error or status code, or `WithMessage(err.Error())`. |
 | MSS004 | warning | `WithIsCertain(true)` on a timeout: `context.DeadlineExceeded`, `os.ErrDeadlineExceeded` or `net.Error.Timeout()`. A library's own timeout error isn't recognised. |
 | MSS005 | info | A `MessageStatus` literal with a message and certainty but no `ErrorReason` (`WrapErrorInStatus` already defaults it to `GenericError`). |
@@ -215,7 +215,7 @@ phone, for example) asks for retries deliberately and isn't reported.
 | Rule | Severity | Flags |
 |---|---|---|
 | GR001 | warning | An `*http.Response` whose body is never closed and isn't passed on. |
-| GR002 | warning | `http.Get`/`Post`/`Head`, `http.NewRequest` without a context, or `http.DefaultClient`. |
+| GR002 | warning | `http.Get`/`Post`/`Head`, or `http.NewRequest` without a context. |
 | GR003 | warning | A request built once with a body and re-sent with `Do` inside a loop; the body is empty on retries. |
 | GR004 | error | `os.Exit`, `log.Fatal*` or zerolog `Fatal()` outside `main`, `init` and `Must*` functions. Panics, including `log.Panic*` and zerolog `Panic()`, aren't flagged: they're alerted on and fixed at the source. |
 | GR007 | warning | A blocking channel send in a Matrix handler: no `select` with a `default` or a receive case like `ctx.Done()`, a timer or a stop channel. |

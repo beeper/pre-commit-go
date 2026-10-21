@@ -43,6 +43,19 @@ func (c *Client) ResolveIdentifier(ctx context.Context, identifier string, creat
 	if err != nil {
 		return nil, err // want `LP001: ResolveIdentifier returns raw error from netlib.Lookup`
 	}
+	_, err = c.client.Lookup(ctx, identifier)
+	switch {
+	case errors.Is(err, context.Canceled):
+		return nil, err
+	case errors.Is(err, ErrInvalidToken):
+		return nil, err
+	case err != nil:
+		return nil, err // want `LP001: ResolveIdentifier returns raw error from netlib.Lookup`
+	}
+	_, err = c.client.Lookup(ctx, identifier)
+	if errors.Is(err, context.Canceled) {
+		return nil, err
+	}
 	return &bridgev2.ResolveIdentifierResponse{}, nil
 }
 
@@ -167,4 +180,9 @@ func (g *GuardedLogin) Start(ctx context.Context) (step *bridgev2.LoginStep, err
 		return nil, err
 	}
 	return nil, netlib.ErrRateLimited
+}
+
+func (c *Client) HandleMatrixViewLimitedMedia(ctx context.Context, msg *bridgev2.MatrixViewLimitedMedia) error {
+	_, err := c.client.Lookup(ctx, msg.Content)
+	return err // want `LP001: HandleMatrixViewLimitedMedia returns raw error from netlib.Lookup`
 }

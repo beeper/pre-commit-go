@@ -68,6 +68,7 @@ type UserLogin struct {
 }
 
 type MatrixMessage struct{ Content string }
+type MatrixViewLimitedMedia struct{ Content string }
 type MatrixMessageResponse struct{}
 type MatrixEdit struct{}
 type MatrixReaction struct{}

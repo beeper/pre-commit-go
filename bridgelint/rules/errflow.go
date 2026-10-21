@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"slices"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
@@ -207,9 +208,11 @@ func (ef *errFlow) rewrittenByDefer(fn ast.Node, sig *types.Signature, idx int) 
 	return found
 }
 
-// guardedByStatusIs reports whether ret returns a local error inside `if errors.Is(err, S)`, where S is
-// a message status or RespError, or inside `if errors.As(err, &target)` with a target of one of those
-// types: the returned error contains the status, so the caller gets it.
+// guardedByStatusIs reports whether ret returns a local error inside `if errors.Is(err, S)` (or a
+// `case errors.Is(err, S):` of a tagless switch), where S is a message status or RespError, or inside
+// `if errors.As(err, &target)` with a target of one of those types: the returned error contains the
+// status, so the caller gets it. S can also be context.Canceled: the caller has gone away, so nobody
+// sees the error.
 func (ef *errFlow) guardedByStatusIs(fn ast.Node, ret *ast.ReturnStmt, e ast.Expr) bool {
 	id, ok := unparen(e).(*ast.Ident)
 	if !ok {
@@ -219,17 +222,35 @@ func (ef *errFlow) guardedByStatusIs(fn ast.Node, ret *ast.ReturnStmt, e ast.Exp
 	if v == nil {
 		return false
 	}
+	match := func(arg ast.Expr) bool {
+		sel, ok := unparen(arg).(*ast.SelectorExpr)
+		return ef.isStatusTarget(arg) || ok && isPkgFunc(ef.info.Uses[sel.Sel], "context", "Canceled")
+	}
 	var prev ast.Node = ret
 	for p := ef.pi.parents[ret]; p != nil && p != fn; prev, p = p, ef.pi.parents[p] {
-		ifs, ok := p.(*ast.IfStmt)
-		if !ok || prev != ifs.Body {
-			continue
-		}
-		if ef.condIsStatus(ifs.Cond, v, ef.isStatusTarget) {
-			return true
+		switch x := p.(type) {
+		case *ast.IfStmt:
+			if prev == x.Body && ef.condIsStatus(x.Cond, v, match) {
+				return true
+			}
+		case *ast.CaseClause:
+			stmt, ok := prev.(ast.Stmt)
+			if !ok || !ef.inTaglessSwitch(x) || !slices.Contains(x.Body, stmt) {
+				continue
+			}
+			for _, cond := range x.List {
+				if ef.condIsStatus(cond, v, match) {
+					return true
+				}
+			}
 		}
 	}
 	return false
+}
+
+func (ef *errFlow) inTaglessSwitch(cc *ast.CaseClause) bool {
+	sw, ok := ef.pi.parents[ef.pi.parents[cc]].(*ast.SwitchStmt)
+	return ok && sw.Tag == nil
 }
 
 // isStatusTarget matches the second argument of errors.Is (a status value) or errors.As (a pointer to

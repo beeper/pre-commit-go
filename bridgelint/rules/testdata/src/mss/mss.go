@@ -119,12 +119,12 @@ func statuses(err error) []error {
 
 func suppressed(err error) error {
 	//bridgelint:ignore MSS002 the framework treats this reason as permanent here
-	return bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusTooOld)
+	return bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusUnsupported)
 }
 
 func bareIgnore(err error) error {
 	//bridgelint:ignore because I said so
-	return bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusTooOld) // want `MSS002`
+	return bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusUnsupported) // want `MSS002`
 }
 
 func (c *Client) HandleMatrixReadReceipt(ctx context.Context, msg *bridgev2.MatrixMessage) error {

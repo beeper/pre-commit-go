@@ -71,7 +71,7 @@ func (c *Client) fetch(ctx context.Context) error {
 	}
 	defer resp2.Body.Close()
 	_, _ = http.NewRequest(http.MethodGet, "https://example.com", nil) // want `GR002: http.NewRequest has no context`
-	_ = http.DefaultClient                                             // want `GR002: http.DefaultClient has no timeout`
+	_ = http.DefaultClient
 	_ = &http.Client{}
 	return nil
 }

@@ -169,10 +169,6 @@ func checkHTTPWithoutCtx(pass *analysis.Pass, f *ast.File) {
 			if isPkgFunc(obj, "net/http", "NewRequest") {
 				report(pass, x, GR002, "http.NewRequest has no context, so the request can't be cancelled; use http.NewRequestWithContext")
 			}
-		case *ast.SelectorExpr:
-			if obj := info.Uses[x.Sel]; isPkgFunc(obj, "net/http", "DefaultClient") {
-				report(pass, x, GR002, "http.DefaultClient has no timeout; use a client with Timeout set")
-			}
 		}
 		return true
 	})

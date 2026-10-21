@@ -35,6 +35,8 @@ var provisioningMethods = map[string]bool{
 	"CreateChatWithGhost": true,
 	"SearchUsers":         true,
 	"GetContactList":      true,
+	// Only called from the provisioning API, which returns the error as an HTTP response.
+	"HandleMatrixViewLimitedMedia": true,
 }
 
 var lifecycleMethods = map[string]bool{
@@ -155,11 +157,10 @@ func (pi *pkgInfo) classify() {
 		name := obj.Name()
 		var scope Scope
 		if implements(recv, networkAPI) {
-			if strings.HasPrefix(name, "HandleMatrix") || strings.HasPrefix(name, "PreHandleMatrix") {
-				scope |= ScopeMatrixHandler
-			}
 			if provisioningMethods[name] {
 				scope |= ScopeProvisioning
+			} else if strings.HasPrefix(name, "HandleMatrix") || strings.HasPrefix(name, "PreHandleMatrix") {
+				scope |= ScopeMatrixHandler
 			}
 			if lifecycleMethods[name] {
 				scope |= ScopeLifecycle

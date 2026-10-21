@@ -27,7 +27,6 @@ var classifierNameRegex = regexp.MustCompile(`^(code|kind|class|reason|status)|C
 var permanentReasons = map[string]bool{
 	"MessageStatusUnsupported":  true,
 	"MessageStatusNoPermission": true,
-	"MessageStatusTooOld":       true,
 }
 
 // errorOnlyLogged are handlers whose errors bridgev2 only logs (or never calls), so no message status
