@@ -61,7 +61,7 @@ type errFlow struct {
 	pi       *pkgInfo
 	info     *types.Info
 	cfg      *Config
-	mappers  map[string]bool
+	mappers  []string
 	visiting map[*ast.FuncDecl]bool
 
 	factPass   *analysis.Pass
@@ -72,12 +72,10 @@ type errFlow struct {
 }
 
 func newErrFlow(pass *analysis.Pass, pi *pkgInfo, cfg *Config, mappers ...[]string) *errFlow {
-	ef := &errFlow{pi: pi, info: pi.pass.TypesInfo, cfg: cfg, mappers: map[string]bool{}, visiting: map[*ast.FuncDecl]bool{}, deferCache: map[ast.Node]bool{}}
-	ef.net, _ = pass.ResultOf[NetAnalyzer].(*netReach)
+	ef := &errFlow{pi: pi, info: pi.pass.TypesInfo, cfg: cfg, visiting: map[*ast.FuncDecl]bool{}, deferCache: map[ast.Node]bool{}}
+	ef.net = netOf(pass)
 	for _, list := range mappers {
-		for _, m := range list {
-			ef.mappers[m] = true
-		}
+		ef.mappers = append(ef.mappers, list...)
 	}
 	return ef
 }
@@ -466,7 +464,7 @@ func (ef *errFlow) classifyCall(fn ast.Node, call *ast.CallExpr, idx, depth int)
 	case isPkgFunc(f, "errors", "Unwrap"):
 		return errOrigin{}
 	}
-	if ef.mappers[f.Name()] {
+	if matchesQualified(f, ef.mappers) {
 		return errOrigin{kind: errGood}
 	}
 	if fd := ef.pi.decls[f]; fd != nil {
@@ -546,7 +544,7 @@ func (ef *errFlow) classifyErrorf(fn ast.Node, call *ast.CallExpr, depth int) er
 	o := errOrigin{kind: errConstructed, node: call, msg: format}
 	for _, arg := range call.Args[1:] {
 		// Package-level sentinels have fixed text, so formatting one doesn't leak anything.
-		if t := ef.info.TypeOf(arg); isErrorType(t) && !ef.isPkgVar(arg) || looksLikeStatusCode(arg) {
+		if t := ef.info.TypeOf(arg); isErrorType(t) && !ef.isPkgVar(arg) || isNetworkStatusField(ef.net, ef.info, arg) {
 			o.formatsErr = true
 		}
 	}
@@ -591,18 +589,37 @@ func (ef *errFlow) isPkgVar(e ast.Expr) bool {
 	return ok && v.Pkg() != nil && v.Parent() == v.Pkg().Scope()
 }
 
-func looksLikeStatusCode(e ast.Expr) bool {
-	var name string
-	switch x := unparen(e).(type) {
-	case *ast.SelectorExpr:
-		name = x.Sel.Name
-	case *ast.Ident:
-		name = x.Name
+func netOf(pass *analysis.Pass) *netReach {
+	r, _ := pass.ResultOf[NetAnalyzer].(*netReach)
+	return r
+}
+
+// isNetworkStatusField reports whether e reads a status or code field of an HTTP response or of a type
+// from a network library. Those are protocol-level numbers: formatting one into an error message puts it
+// in front of users, and copying one into a RespError sends it as the HTTP status.
+func isNetworkStatusField(net *netReach, info *types.Info, e ast.Expr) bool {
+	sel, ok := unparen(e).(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	switch sel.Sel.Name {
+	case "Status", "StatusCode", "Code":
 	default:
 		return false
 	}
-	lower := strings.ToLower(name)
-	return strings.Contains(lower, "status") || lower == "code" || strings.HasSuffix(lower, "code")
+	selection, ok := info.Selections[sel]
+	if !ok || selection.Kind() != types.FieldVal {
+		return false
+	}
+	if isHTTPStruct(selection.Recv(), "Response") {
+		return true
+	}
+	t := selection.Recv()
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+	named, ok := types.Unalias(t).(*types.Named)
+	return ok && named.Obj().Pkg() != nil && net.pkgReaches(named.Obj().Pkg())
 }
 
 // wrapVerbArgs returns the operand indexes consumed by %w verbs.
@@ -614,16 +631,25 @@ func wrapVerbArgs(format string) []int {
 			continue
 		}
 		i++
-		for i < len(format) && strings.IndexByte("+-# 0123456789.*[]", format[i]) >= 0 {
-			if format[i] == '*' {
+	flags:
+		for i < len(format) {
+			switch c := format[i]; {
+			case strings.IndexByte("+-# 0123456789.", c) >= 0:
+				i++
+			case c == '*':
 				arg++
+				i++
+			case c == '[':
+				n, end, ok := explicitArgIndex(format, i)
+				if !ok {
+					break flags
+				}
+				arg, i = n, end
+			default:
+				break flags
 			}
-			i++
 		}
-		if i >= len(format) {
-			break
-		}
-		if format[i] == '%' {
+		if i >= len(format) || format[i] == '%' {
 			continue
 		}
 		if format[i] == 'w' {
@@ -632,6 +658,21 @@ func wrapVerbArgs(format string) []int {
 		arg++
 	}
 	return out
+}
+
+// explicitArgIndex parses an argument index like "[2]" at i, returning the zero-based operand it selects
+// and the offset after the "]".
+func explicitArgIndex(format string, i int) (arg, end int, ok bool) {
+	j := i + 1
+	n := 0
+	for j < len(format) && format[j] >= '0' && format[j] <= '9' {
+		n = n*10 + int(format[j]-'0')
+		j++
+	}
+	if n < 1 || j >= len(format) || format[j] != ']' {
+		return 0, i, false
+	}
+	return n - 1, j + 1, true
 }
 
 func stringArg(info *types.Info, call *ast.CallExpr, i int) (string, bool) {

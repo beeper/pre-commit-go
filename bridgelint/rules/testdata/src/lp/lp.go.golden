@@ -101,9 +101,22 @@ var (
 
 func isLimit(err error) bool { return errors.Is(err, mautrix.MLimitExceeded) }
 
-func passthrough(code int, err error) error {
-	te := struct{ Code int }{code}
-	return bridgev2.RespError{ErrCode: "FI.MAU.EX.UPSTREAM", Err: "upstream", StatusCode: te.Code} // want `LP004: HTTP status copied from a network error code`
+func passthrough(err error) error {
+	var te *netlib.APIError
+	if errors.As(err, &te) {
+		return bridgev2.RespError{ErrCode: "FI.MAU.EX.UPSTREAM", Err: "upstream", StatusCode: te.Code} // want `LP004: HTTP status copied from a network error code`
+	}
+	return nil
+}
+
+func passthroughResponse(resp *http.Response) error {
+	return bridgev2.RespError{ErrCode: "FI.MAU.EX.UPSTREAM", Err: "upstream", StatusCode: resp.StatusCode} // want `LP004: HTTP status copied from a network error code`
+}
+
+// A status that isn't a protocol field is a deliberate choice, not a passthrough.
+func mappedStatus(internal int) error {
+	cfg := struct{ Code int }{internal}
+	return bridgev2.RespError{ErrCode: "FI.MAU.EX.UPSTREAM", Err: "upstream", StatusCode: cfg.Code}
 }
 
 type logger struct{}

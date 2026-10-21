@@ -25,6 +25,16 @@ type Client struct {
 
 var ErrRateLimited error
 
+var ErrUnauthorized error
+
+// APIError is a protocol error carrying the remote's own status code.
+type APIError struct {
+	Code int
+	Msg  string
+}
+
+func (e *APIError) Error() string { return e.Msg }
+
 // Transport is implemented outside this package (see wstransport), so calls through it are resolved by
 // importers that can see the implementation.
 type Transport interface {

@@ -23,6 +23,9 @@ var (
 )
 
 func runGR(pass *analysis.Pass) (any, error) {
+	if err := ConfigError(pass); err != nil {
+		return nil, err
+	}
 	pi := infoFor(pass)
 	for _, f := range pass.Files {
 		if isTestFile(pass, f) {
@@ -215,7 +218,7 @@ func checkRetryBody(pass *analysis.Pass, fd *ast.FuncDecl) {
 	if len(bodyReqs) == 0 {
 		return
 	}
-	if strings.Contains(nodeText(pass, fd.Body), "GetBody") {
+	if setsGetBody(info, fd) {
 		return
 	}
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
@@ -253,6 +256,32 @@ func checkRetryBody(pass *analysis.Pass, fd *ast.FuncDecl) {
 	})
 }
 
+// setsGetBody reports whether fd sets Request.GetBody, which lets the body be replayed on a retry.
+func setsGetBody(info *types.Info, fd *ast.FuncDecl) bool {
+	found := false
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.SelectorExpr:
+			if sel, ok := info.Selections[x]; ok && x.Sel.Name == "GetBody" && sel.Kind() == types.FieldVal && isHTTPStruct(sel.Recv(), "Request") {
+				found = true
+			}
+		case *ast.CompositeLit:
+			if !isHTTPStruct(info.TypeOf(x), "Request") {
+				return true
+			}
+			for _, elt := range x.Elts {
+				if kv, ok := elt.(*ast.KeyValueExpr); ok {
+					if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "GetBody" {
+						found = true
+					}
+				}
+			}
+		}
+		return !found
+	})
+	return found
+}
+
 // checkExits implements GR004.
 func checkExits(pass *analysis.Pass, pi *pkgInfo, f *ast.File) {
 	if pass.Pkg.Name() == "main" {
@@ -276,7 +305,7 @@ func checkExits(pass *analysis.Pass, pi *pkgInfo, f *ast.File) {
 			// Panic variants aren't reported: they're a logged panic, and plain panics aren't either.
 			case isPkgFunc(obj, "log", "Fatal", "Fatalf", "Fatalln"):
 				report(pass, call, GR004, fmt.Sprintf("log.%s in connector or library code kills the process; return an error instead", obj.Name()))
-			case obj != nil && obj.Name() == "Fatal" && recvType(obj) != nil && strings.Contains(recvType(obj).String(), "zerolog"):
+			case isPkgFunc(obj, pathZerolog, "Fatal"):
 				report(pass, call, GR004, "zerolog Fatal() exits the process; log at Error and return an error instead")
 			}
 			return true
@@ -299,10 +328,8 @@ func checkCursorBeforeHandled(pass *analysis.Pass, fd *ast.FuncDecl) {
 		}
 		found := false
 		ast.Inspect(body, func(m ast.Node) bool {
-			if call, ok := m.(*ast.CallExpr); ok {
-				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "QueueRemoteEvent" {
-					found = true
-				}
+			if call, ok := m.(*ast.CallExpr); ok && isPkgFunc(calleeObj(pass.TypesInfo, call), pathBridgev2, "QueueRemoteEvent") {
+				found = true
 			}
 			return !found
 		})
@@ -392,11 +419,9 @@ func rootPkgVar(info *types.Info, pkg *types.Package, e ast.Expr) *types.Var {
 	}
 }
 
+// isMutableShared reports whether t is a map or slice. sync.Map, atomic.Value and the rest synchronise
+// themselves and are structs, so the underlying type is all this has to look at.
 func isMutableShared(t types.Type) bool {
-	s := t.String()
-	if strings.HasPrefix(s, "sync.") || strings.HasPrefix(s, "*sync.") || strings.Contains(s, "sync/atomic") || strings.Contains(s, "atomic.") {
-		return false
-	}
 	switch t.Underlying().(type) {
 	case *types.Map, *types.Slice:
 		return true

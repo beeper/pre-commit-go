@@ -40,8 +40,10 @@ func runMSS(pass *analysis.Pass) (any, error) {
 	if len(pass.Files) == 0 {
 		return nil, nil
 	}
+	if err := ConfigError(pass); err != nil {
+		return nil, err
+	}
 	pi := infoFor(pass)
-	checkIgnores(pass)
 	cfg := ConfigFor(pass)
 	ef := newErrFlow(pass, pi, cfg, cfg.StatusMappers).withFacts(pass, newMSSFact)
 	if !pi.isBridge {
@@ -169,6 +171,9 @@ func exprShowsError(info *types.Info, e ast.Expr) bool {
 	return found
 }
 
+// mentionsTimeout reports whether e is a timeout: one of the standard deadline sentinels, or a call to
+// net.Error's Timeout method. A library's own timeout error isn't recognisable without being told, and
+// guessing from the name of the variable holding it flagged unrelated code.
 func mentionsTimeout(info *types.Info, e ast.Expr) bool {
 	found := false
 	ast.Inspect(e, func(n ast.Node) bool {
@@ -179,11 +184,8 @@ func mentionsTimeout(info *types.Info, e ast.Expr) bool {
 					found = true
 				}
 			}
-			if strings.Contains(strings.ToLower(x.Sel.Name), "timedout") || strings.Contains(strings.ToLower(x.Sel.Name), "timeout") {
-				found = true
-			}
-		case *ast.Ident:
-			if strings.Contains(strings.ToLower(x.Name), "timeout") || strings.Contains(strings.ToLower(x.Name), "timedout") {
+		case *ast.CallExpr:
+			if obj, ok := calleeObj(info, x).(*types.Func); ok && obj.Name() == "Timeout" && isNamed(recvType(obj), "net", "Error") {
 				found = true
 			}
 		}

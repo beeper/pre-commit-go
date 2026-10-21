@@ -1,3 +1,4 @@
 error_prefix: ex
 disconnect_events:
   example.com/netlib: ["*DisconnectEvent"]
+auth_errors: [netlib.ErrUnauthorized]

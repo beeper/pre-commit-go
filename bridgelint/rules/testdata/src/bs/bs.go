@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"example.com/netlib"
@@ -91,6 +92,54 @@ func (c *Client) giveUpLoop(ctx context.Context) {
 func (c *Client) authCheck(statusCode int) {
 	if statusCode == 401 {
 		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "ex-unauthorized", Message: "x"}) // want `BS010: TRANSIENT_DISCONNECT under an auth check`
+	}
+}
+
+func (c *Client) authCheckConstant(resp *http.Response) {
+	if resp.StatusCode == http.StatusForbidden {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "ex-forbidden", Message: "x"}) // want `BS010: TRANSIENT_DISCONNECT under an auth check`
+	}
+}
+
+func (c *Client) authCheckSentinel(err error) {
+	if errors.Is(err, netlib.ErrUnauthorized) {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "ex-session-gone", Message: "x"}) // want `BS010: TRANSIENT_DISCONNECT under an auth check`
+	}
+}
+
+// A status that isn't 401 or 403 says nothing about the session.
+func (c *Client) rateLimitCheck(resp *http.Response) {
+	if resp.StatusCode == http.StatusTooManyRequests {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: "ex-rate-limited", Message: "x"})
+	}
+}
+
+// BAD_CREDENTIALS behind a sentinel check is the correct shape, not a catch-all.
+func (c *Client) authAware(ctx context.Context) {
+	err := c.client.Connect(ctx)
+	if errors.Is(err, netlib.ErrUnauthorized) {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "ex-invalid-auth"})
+	}
+}
+
+// A state built as UNKNOWN_ERROR and upgraded under an auth check is the right shape, even though the
+// literal itself sits under the bare error check.
+func (c *Client) upgradedUnderAuthCheck(ctx context.Context, resp *http.Response) {
+	if err := c.client.Connect(ctx); err != nil {
+		state := status.BridgeState{StateEvent: status.StateUnknownError, Error: "ex-connect-failed", Message: "could not connect"}
+		if resp.StatusCode == http.StatusUnauthorized {
+			state.StateEvent = status.StateBadCredentials
+			state.Error = "ex-invalid-auth"
+		}
+		c.UserLogin.BridgeState.Send(state)
+	}
+}
+
+func (c *Client) elseCatchAll(ctx context.Context) {
+	if err := c.client.Connect(ctx); err == nil {
+		return
+	} else {
+		c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: "ex-invalid-auth"}) // want `BS011: BAD_CREDENTIALS sent for every connect error`
 	}
 }
 

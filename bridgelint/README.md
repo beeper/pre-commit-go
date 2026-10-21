@@ -71,6 +71,10 @@ This should be rare. Put a comment on the line, or the line above:
 
 A reason is required. An ignore without rule IDs or without a reason is reported as `BL000`.
 
+Rules marked "name heuristic" in the tables below have no type information to work from: a cursor field
+or a stopping method is only recognisable by its name. They're warnings for that reason, and shouldn't
+be promoted to errors. Every other rule matches on types, and no rule matches on source text.
+
 Errors are followed through same-package helpers, so a mapper that returns `WrapErrorInStatus(...)` or a
 `RespError` is recognised automatically. Mappers that sometimes return the error unchanged can be listed
 in `status_mappers`/`login_mappers` in the config. A function with a deferred closure that maps its named
@@ -87,6 +91,7 @@ code_format_allowlist: ["slack-%s"]      # BS004: fmt.Sprintf formats known to b
 status_mappers: [wrapSendError]          # MSS001: functions whose result is a proper status
 login_mappers: [wrapLoginError]          # LP001: functions whose result is a proper RespError
 classifiers: [slackAPIErrorCode]         # MSS006: typed error-code accessors
+auth_errors: [slack.ErrInvalidAuth]      # BS010, BS011: the library's rejected-session sentinels
 network_packages:                        # packages whose functions all count as reaching the network (see below)
   - github.com/slack-go/slack
   - go.mau.fi/mautrix-slack/pkg/...
@@ -130,6 +135,9 @@ Plain `errors.New`/`fmt.Errorf` errors that don't wrap a network error are treat
 invariants (bad portal IDs, impossible states) and aren't reported, except when `CreateLogin` returns
 one to reject a flow ID (LP001). Error rules don't match on error message text.
 
+Returns inside a function literal aren't followed, so a handler that does its work in a closure
+(`return c.withLock(func() error { ... })`) isn't checked.
+
 Rules that depend on newer bridgev2 behaviour check the module's `maunium.net/go/mautrix` version (from
 `go list -m`) and stay quiet when the pinned version doesn't have it.
 
@@ -145,9 +153,9 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 | MSS001 | error | A handler returns a network error unmapped: as is, or wrapped in `fmt.Errorf`, directly or through a same-package helper. |
 | MSS002 | error | A permanent rejection stays retriable: `ErrorReason` `Unsupported`/`NoPermission`/`TooOld` without `WithStatus(event.MessageStatusFail)`. |
 | MSS003 | warning | Raw error text shown to users: `WithErrorAsMessage()` on a library error or on `fmt.Errorf` that formats another error or status code, or `WithMessage(err.Error())`. |
-| MSS004 | warning | `WithIsCertain(true)` on a timeout. |
+| MSS004 | warning | `WithIsCertain(true)` on a timeout: `context.DeadlineExceeded`, `os.ErrDeadlineExceeded` or `net.Error.Timeout()`. A library's own timeout error isn't recognised. |
 | MSS005 | info | A `MessageStatus` literal with a message and certainty but no `ErrorReason` (`WrapErrorInStatus` already defaults it to `GenericError`). |
-| MSS006 | warning | The package has a typed error classifier (a `func(error) string/int` named like `*Code`/`*Kind`/`*Status` that calls `errors.As`, or one listed in `classifiers`) but a handler returns network errors without using it. |
+| MSS006 | warning | The package has a typed error classifier (a `func(error) string/int` named like `*Code`/`*Kind`/`*Status` that calls `errors.As`, or one listed in `classifiers`) but a handler returns network errors without using it. Name heuristic. |
 
 ### Bridge states (BS)
 
@@ -158,9 +166,9 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 | BS003 | error | `Message` built from `err.Error()` or `fmt.Sprintf(..., err)`. Warning when the code has a `BridgeStateHumanErrors` entry, since the text is then silently discarded. |
 | BS004 | error | An error state with no `Error` code, a code that doesn't match `<error_prefix>-<reason>`, or a code built with `fmt.Sprintf`. |
 | BS005 | warning | A code with no `Message` and no `BridgeStateHumanErrors` entry anywhere in the linted packages. |
-| BS009 | warning | An event-handler type switch for a configured library with no case for its disconnect events. |
-| BS010 | warning | `TRANSIENT_DISCONNECT` under a 401/403/auth check. |
-| BS011 | warning | `BAD_CREDENTIALS` for every connect error: in a `default`/`else` branch, or directly under `if err != nil` after a `Connect` call. |
+| BS009 | warning | An event-handler type switch for a configured library with no case for its disconnect events. The switch is recognised by its case types being named like events, a name heuristic. |
+| BS010 | warning | `TRANSIENT_DISCONNECT` reached under a check for a rejected session: a comparison against 401 or 403 (`http.StatusUnauthorized` and friends included, since they're constants), or `errors.Is`/`errors.As` against one of the `auth_errors`. |
+| BS011 | warning | `BAD_CREDENTIALS` for every connect error: in a `default`/`else` branch whose condition tests an error without checking for a rejected session, or directly under `if err != nil` on a network call. |
 
 ### Login and provisioning (LP)
 
@@ -199,10 +207,10 @@ phone, for example) asks for retries deliberately and isn't reported.
 | GR003 | warning | A request built once with a body and re-sent with `Do` inside a loop; the body is empty on retries. |
 | GR004 | error | `os.Exit`, `log.Fatal*` or zerolog `Fatal()` outside `main`, `init` and `Must*` functions. Panics, including `log.Panic*` and zerolog `Panic()`, aren't flagged: they're alerted on and fixed at the source. |
 | GR007 | warning | A blocking channel send in a Matrix handler (no `select` with `default` or `ctx.Done()`). |
-| GR008 | warning | A cursor/seq/checkpoint field assigned after a loop that calls `QueueRemoteEvent`, before the events are handled. |
+| GR008 | warning | A cursor/seq/checkpoint field assigned after a loop that calls `QueueRemoteEvent`, before the events are handled. The field is recognised by name, a name heuristic. |
 | GR009 | warning | A package-level map or slice written at runtime in a bridge package, shared by every login. |
 | GR011 | warning | `GetCapabilities` changes `RoomFeatures` fields but never the `ID`, so clients cache the wrong features. |
-| GR013 | warning | `LogoutRemote` that never disconnects or stops the client, when the pinned mautrix doesn't disconnect after `LogoutRemote` itself (v0.32.0 and earlier). |
+| GR013 | warning | `LogoutRemote` that never disconnects or stops the client, when the pinned mautrix doesn't disconnect after `LogoutRemote` itself (v0.32.0 and earlier). The stopping call is recognised by name, a name heuristic. |
 
 ### Deliberately not included
 
@@ -225,7 +233,8 @@ These were considered and left out because they can't be checked without false p
   `UNKNOWN_ERROR`, and libraries often classify and retry connect errors themselves (whatsmeow does with
   `InitialAutoReconnect`), which isn't visible from the bridge.
 - A golangci-lint plugin. The analyzers in `rules` are plain `go/analysis` analyzers, so wiring one up
-  is mostly boilerplate.
+  is mostly boilerplate, but they're built for one package per process: the per-package AST parent map
+  is cached for the life of the process and never evicted.
 
 ## Development
 

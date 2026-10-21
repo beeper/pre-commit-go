@@ -32,26 +32,30 @@ var BSAnalyzer = &analysis.Analyzer{
 	FactTypes: []analysis.Fact{new(bsErrFact), new(humanKeysFact)},
 }
 
-var (
-	eventTypeNameRegex = regexp.MustCompile(`(Event|Create|Update|Delete|Ready|Connect|Disconnect)$`)
-	authCondRegex      = regexp.MustCompile(`(?i)\b40[13]\b|StatusUnauthorized|StatusForbidden|Unauthori[sz]ed|Forbidden|AuthError|InvalidAuth|BadCredentials`)
-)
+// eventTypeNameRegex recognises a library's event types by name: nothing in their types marks them as
+// events, so BS009 can only find the handler's type switch this way.
+var eventTypeNameRegex = regexp.MustCompile(`(Event|Create|Update|Delete|Ready|Connect|Disconnect)$`)
 
 type stateLit struct {
-	lit     *ast.CompositeLit
-	qual    string
-	fn      ast.Node
-	fields  map[string]ast.Expr
-	event   string
-	code    string
-	hasCode bool
-	codeOK  bool // code is a constant
-	action  string
+	lit  *ast.CompositeLit
+	qual string
+	fn   ast.Node
+	// eventSetAt is where StateEvent got its value: the literal, or the later assignment that changed it.
+	eventSetAt ast.Node
+	fields     map[string]ast.Expr
+	event      string
+	code       string
+	hasCode    bool
+	codeOK     bool // code is a constant
+	action     string
 }
 
 func runBS(pass *analysis.Pass) (any, error) {
 	if len(pass.Files) == 0 {
 		return nil, nil
+	}
+	if err := ConfigError(pass); err != nil {
+		return nil, err
 	}
 	pi := infoFor(pass)
 	keys := CollectHumanErrorKeys(pass.TypesInfo, pass.Files)
@@ -143,6 +147,7 @@ func collectStateLits(pass *analysis.Pass, pi *pkgInfo) []*stateLit {
 					}
 				}
 			}
+			sl.eventSetAt = lit
 			mergeLaterAssignments(pass, pi, sl)
 			if e, ok := sl.fields["StateEvent"]; ok {
 				sl.event, _ = constString(info, e)
@@ -195,6 +200,9 @@ func mergeLaterAssignments(pass *analysis.Pass, pi *pkgInfo, sl *stateLit) {
 			}
 			if id, ok := sel.X.(*ast.Ident); ok && pass.TypesInfo.ObjectOf(id) == v {
 				sl.fields[sel.Sel.Name] = as.Rhs[i]
+				if sel.Sel.Name == "StateEvent" {
+					sl.eventSetAt = as
+				}
 			}
 		}
 		return true
@@ -255,16 +263,34 @@ func checkStateLit(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, s
 	}
 
 	// BS010
-	if sl.event == "TRANSIENT_DISCONNECT" {
-		if cond := enclosingCondText(pass, pi, lit); authCondRegex.MatchString(cond) {
-			report(pass, lit, BS010, "TRANSIENT_DISCONNECT under an auth check; a rejected session won't recover by waiting, send BAD_CREDENTIALS")
-		}
+	if sl.event == "TRANSIENT_DISCONNECT" && authGuarded(pass, pi, cfg, sl.eventSetAt) {
+		report(pass, lit, BS010, "TRANSIENT_DISCONNECT under an auth check; a rejected session won't recover by waiting, send BAD_CREDENTIALS")
 	}
 
-	// BS011
-	if sl.event == "BAD_CREDENTIALS" && isCatchAllAuth(pass, pi, ef, sl) {
+	// BS011. A state the code only upgrades to BAD_CREDENTIALS under an auth check is the right shape,
+	// even though the literal it was built from sits under the bare error check.
+	if sl.event == "BAD_CREDENTIALS" && !authGuarded(pass, pi, cfg, sl.eventSetAt) && isCatchAllAuth(pass, pi, ef, cfg, sl) {
 		report(pass, lit, BS011, "BAD_CREDENTIALS sent for every connect error; only send it for errors that mean the session is invalid")
 	}
+}
+
+func isErrorsIsCall(info *types.Info, e ast.Expr) bool {
+	call, ok := unparen(e).(*ast.CallExpr)
+	return ok && isPkgFunc(calleeObj(info, call), "errors", "Is", "As")
+}
+
+// condUsesError reports whether cond reads a variable that holds an error.
+func condUsesError(info *types.Info, cond ast.Expr) bool {
+	found := false
+	ast.Inspect(cond, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok {
+			if _, isVar := info.Uses[id].(*types.Var); isVar && isErrorType(info.TypeOf(id)) {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
 }
 
 func describeState(sl *stateLit) string {
@@ -309,23 +335,97 @@ func isEmptyString(info *types.Info, e ast.Expr) bool {
 	return ok && s == ""
 }
 
-func enclosingCondText(pass *analysis.Pass, pi *pkgInfo, n ast.Node) string {
-	var parts []string
+// enclosingConds returns the conditions n is reached under: the condition of every if statement whose
+// body contains it, and the expressions of every case clause it sits in.
+func enclosingConds(pi *pkgInfo, n ast.Node) []ast.Expr {
+	var conds []ast.Expr
 	for p := pi.parents[n]; p != nil; p = pi.parents[p] {
 		switch x := p.(type) {
 		case *ast.FuncDecl, *ast.FuncLit:
-			return strings.Join(parts, " ")
+			return conds
 		case *ast.IfStmt:
 			if containsNode(x.Body, n) {
-				parts = append(parts, nodeText(pass, x.Cond))
+				conds = append(conds, x.Cond)
 			}
 		case *ast.CaseClause:
-			for _, e := range x.List {
-				parts = append(parts, nodeText(pass, e))
-			}
+			conds = append(conds, x.List...)
 		}
 	}
-	return strings.Join(parts, " ")
+	return conds
+}
+
+// authGuarded reports whether n is only reached when the code has established that the session was
+// rejected.
+func authGuarded(pass *analysis.Pass, pi *pkgInfo, cfg *Config, n ast.Node) bool {
+	if n == nil {
+		return false
+	}
+	for _, cond := range enclosingConds(pi, n) {
+		if condChecksAuth(pass, cfg, cond) {
+			return true
+		}
+	}
+	return false
+}
+
+// condChecksAuth reports whether cond tests for a rejected session: a comparison against HTTP 401 or
+// 403, or errors.Is/As against one of the configured auth_errors.
+func condChecksAuth(pass *analysis.Pass, cfg *Config, cond ast.Expr) bool {
+	info := pass.TypesInfo
+	found := false
+	ast.Inspect(cond, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.BinaryExpr:
+			if x.Op != token.EQL && x.Op != token.NEQ {
+				return true
+			}
+			for _, side := range []ast.Expr{x.X, x.Y} {
+				if v, ok := constInt(info, side); ok && (v == 401 || v == 403) {
+					found = true
+				}
+			}
+		case *ast.CallExpr:
+			if !isPkgFunc(calleeObj(info, x), "errors", "Is", "As") || len(x.Args) != 2 {
+				return true
+			}
+			target := unparen(x.Args[1])
+			if u, ok := target.(*ast.UnaryExpr); ok && u.Op == token.AND {
+				target = unparen(u.X)
+			}
+			if sel, ok := target.(*ast.SelectorExpr); ok {
+				target = sel.Sel
+			}
+			if id, ok := target.(*ast.Ident); ok && matchesQualified(info.Uses[id], cfg.AuthErrors) {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// matchesQualified reports whether obj is named by one of names, each either a bare name or
+// package-qualified ("slack.ErrInvalidAuth", by import path or package name).
+func matchesQualified(obj types.Object, names []string) bool {
+	if obj == nil {
+		return false
+	}
+	for _, want := range names {
+		pkg, name, qualified := strings.Cut(want, ".")
+		if !qualified {
+			if obj.Name() == want {
+				return true
+			}
+			continue
+		}
+		if i := strings.LastIndexByte(want, '.'); i >= 0 {
+			pkg, name = want[:i], want[i+1:]
+		}
+		if obj.Name() == name && obj.Pkg() != nil && (obj.Pkg().Path() == pkg || obj.Pkg().Name() == pkg) {
+			return true
+		}
+	}
+	return false
 }
 
 func nodeText(pass *analysis.Pass, n ast.Node) string {
@@ -339,7 +439,7 @@ func nodeText(pass *analysis.Pass, n ast.Node) string {
 }
 
 // isCatchAllAuth reports BAD_CREDENTIALS in a default/else branch, or directly under `if err != nil` after a connect call.
-func isCatchAllAuth(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, sl *stateLit) bool {
+func isCatchAllAuth(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, sl *stateLit) bool {
 	var child ast.Node = sl.lit
 	for p := pi.parents[sl.lit]; p != nil; child, p = p, pi.parents[p] {
 		switch x := p.(type) {
@@ -357,7 +457,7 @@ func isCatchAllAuth(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, sl *stateLit)
 			ast.Inspect(sw.Body, func(n ast.Node) bool {
 				if cc, ok := n.(*ast.CaseClause); ok {
 					for _, e := range cc.List {
-						if isErrorType(pass.TypesInfo.TypeOf(e)) || strings.Contains(nodeText(pass, e), "errors.Is") {
+						if isErrorType(pass.TypesInfo.TypeOf(e)) || isErrorsIsCall(pass.TypesInfo, e) {
 							mentionsErr = true
 						}
 					}
@@ -367,14 +467,12 @@ func isCatchAllAuth(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, sl *stateLit)
 			return mentionsErr
 		case *ast.IfStmt:
 			if x.Else == child {
-				cond := nodeText(pass, x.Cond)
 				_, isBlock := x.Else.(*ast.BlockStmt)
-				return isBlock && strings.Contains(cond, "err") && !authCondRegex.MatchString(cond)
+				return isBlock && condUsesError(pass.TypesInfo, x.Cond) && !condChecksAuth(pass, cfg, x.Cond)
 			}
 			if containsNode(x.Body, sl.lit) {
 				if be, ok := x.Cond.(*ast.BinaryExpr); ok && be.Op == token.NEQ && isErrorInterface(pass.TypesInfo.TypeOf(be.X)) {
-					o := ef.classify(sl.fn, be.X, x.Body.Pos(), 0)
-					if o.kind == errRaw && strings.Contains(o.calleeFuncName(), "Connect") {
+					if o := ef.classify(sl.fn, be.X, x.Body.Pos(), 0); o.kind == errRaw {
 						return true
 					}
 				}

@@ -101,6 +101,7 @@ type ignoreEntry struct {
 
 type passState struct {
 	cfg     *Config
+	cfgErr  error
 	ignores map[string]map[int]*ignoreEntry
 }
 
@@ -120,26 +121,14 @@ func stateFor(pass *analysis.Pass) *passState {
 		lines := map[int]*ignoreEntry{}
 		for _, cg := range f.Comments {
 			for _, c := range cg.List {
-				m := ignoreRegex.FindStringSubmatch(c.Text)
-				if m == nil {
-					continue
+				if entry := parseIgnore(c.Text); entry != nil {
+					lines[pass.Fset.Position(c.Pos()).Line] = entry
 				}
-				fields := strings.Fields(m[1])
-				entry := &ignoreEntry{rules: map[string]struct{}{}}
-				for i, field := range fields {
-					if _, ok := Rules[field]; ok || field == "all" {
-						entry.rules[field] = struct{}{}
-						continue
-					}
-					entry.reason = strings.Join(fields[i:], " ")
-					break
-				}
-				lines[pass.Fset.Position(c.Pos()).Line] = entry
 			}
 		}
 		st.ignores[name] = lines
 	}
-	st.cfg = LoadConfig(dir)
+	st.cfg, st.cfgErr = LoadConfig(dir)
 	actual, _ := passStates.LoadOrStore(pass, st)
 	return actual.(*passState)
 }
@@ -164,6 +153,12 @@ func (st *passState) ignored(pos token.Position, id string) bool {
 // ConfigFor returns the .bridgelint.yaml that applies to the package being analysed.
 func ConfigFor(pass *analysis.Pass) *Config {
 	return stateFor(pass).cfg
+}
+
+// ConfigError returns why the config couldn't be read, so an analyzer can fail with a message naming
+// the file instead of running with defaults the author didn't ask for.
+func ConfigError(pass *analysis.Pass) error {
+	return stateFor(pass).cfgErr
 }
 
 type reportOpt func(*analysis.Diagnostic, *Severity)
@@ -206,16 +201,45 @@ func reportRange(pass *analysis.Pass, pos, end token.Pos, id string, msg string,
 	pass.Report(d)
 }
 
+// parseIgnore reads a //bridgelint:ignore directive: the rule IDs it suppresses, then the reason. It
+// returns nil for any other comment.
+func parseIgnore(text string) *ignoreEntry {
+	m := ignoreRegex.FindStringSubmatch(text)
+	if m == nil {
+		return nil
+	}
+	fields := strings.Fields(m[1])
+	entry := &ignoreEntry{rules: map[string]struct{}{}}
+	for i, field := range fields {
+		if _, ok := Rules[field]; ok || field == "all" {
+			entry.rules[field] = struct{}{}
+			continue
+		}
+		entry.reason = strings.Join(fields[i:], " ")
+		break
+	}
+	return entry
+}
+
+var BLAnalyzer = &analysis.Analyzer{
+	Name: "bl",
+	Doc:  "suppression hygiene (BL000): every bridgelint:ignore names the rules it suppresses and why",
+	Run:  runBL,
+}
+
+func runBL(pass *analysis.Pass) (any, error) {
+	if err := ConfigError(pass); err != nil {
+		return nil, err
+	}
+	checkIgnores(pass)
+	return nil, nil
+}
+
 func checkIgnores(pass *analysis.Pass) {
-	st := stateFor(pass)
 	for _, f := range pass.Files {
 		for _, cg := range f.Comments {
 			for _, c := range cg.List {
-				m := ignoreRegex.FindStringSubmatch(c.Text)
-				if m == nil {
-					continue
-				}
-				entry := st.ignores[pass.Fset.Position(c.Pos()).Filename][pass.Fset.Position(c.Pos()).Line]
+				entry := parseIgnore(c.Text)
 				if entry == nil {
 					continue
 				}

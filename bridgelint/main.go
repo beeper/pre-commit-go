@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"go/token"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,6 +40,7 @@ const (
 const (
 	envConfig         = "BRIDGELINT_CONFIG"
 	envMautrixVersion = "BRIDGELINT_MAUTRIX_VERSION"
+	envConfigID       = "BRIDGELINT_CONFIG_ID"
 )
 
 var (
@@ -85,6 +87,13 @@ func main() {
 	if isVetTool(os.Args[1:]) {
 		rules.ConfigOverride = os.Getenv(envConfig)
 		rules.MautrixVersion = os.Getenv(envMautrixVersion)
+		if os.Args[1] == "-V=full" {
+			if err := printToolID(); err != nil {
+				fmt.Fprintf(os.Stderr, "bridgelint: %v\n", err)
+				os.Exit(2)
+			}
+			return
+		}
 		unitchecker.Main(rules.Analyzers...)
 		return
 	}
@@ -111,6 +120,91 @@ func isVetTool(args []string) bool {
 		return false
 	}
 	return args[0] == "-V=full" || args[0] == "-flags" || strings.HasSuffix(args[len(args)-1], ".cfg")
+}
+
+// printToolID answers `-V=full`, which the go command uses to identify this vet tool and folds into the
+// cache key of every package it analyses. unitchecker would print a hash of the binary alone, but the
+// findings also depend on the config and the pinned mautrix version, which the go command can't see: a
+// cached package would keep reporting what the previous config said. Mixing the fingerprint the driver
+// computed into the build ID makes a config change invalidate the cache.
+func printToolID() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(exe)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	fmt.Fprintf(h, "\x00config-id=%s", os.Getenv(envConfigID))
+	fmt.Printf("%s version devel comments-go-here buildID=%02x\n", exe, h.Sum(nil))
+	return nil
+}
+
+// configID fingerprints the inputs that change what the rules report but that the go command's vet cache
+// doesn't cover: the mautrix version, the file given with -config, and every .bridgelint.yaml in the
+// module, since each package resolves the nearest one above it.
+func configID(configAbs, mautrix string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "mautrix=%s\n", mautrix)
+	if configAbs != "" {
+		fmt.Fprintf(h, "config=%s\n", configAbs)
+		data, err := os.ReadFile(configAbs)
+		if err != nil {
+			fmt.Fprintf(h, "unreadable=%v\n", err)
+		}
+		h.Write(data)
+	}
+	root := moduleRoot()
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if name := d.Name(); path != root && (name == ".git" || name == "vendor" || strings.HasPrefix(name, "_")) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.Name() != rules.ConfigFileName {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			rel = path
+		}
+		fmt.Fprintf(h, "file=%s\n", filepath.ToSlash(rel))
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			fmt.Fprintf(h, "unreadable=%v\n", readErr)
+		}
+		h.Write(data)
+		return nil
+	})
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// moduleRoot walks up from the working directory to the go.mod, matching where config lookup stops.
+func moduleRoot() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	for dir := cwd; ; {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return cwd
+		}
+		dir = parent
+	}
 }
 
 // mautrixVersion asks the go command which mautrix the current module builds against.
@@ -154,8 +248,13 @@ func run(patterns []string) int {
 			return 2
 		}
 	}
+	mautrix := mautrixVersion()
 	cmd := exec.Command("go", append([]string{"vet", "-vettool=" + exe, "-json"}, patterns...)...)
-	cmd.Env = append(os.Environ(), envConfig+"="+configAbs, envMautrixVersion+"="+mautrixVersion())
+	cmd.Env = append(os.Environ(),
+		envConfig+"="+configAbs,
+		envMautrixVersion+"="+mautrix,
+		envConfigID+"="+configID(configAbs, mautrix),
+	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	runErr := cmd.Run()
@@ -238,6 +337,7 @@ func run(patterns []string) int {
 func parseVetJSON(r io.Reader) ([]finding, []string, error) {
 	cwd, _ := os.Getwd()
 	seen := map[string]bool{}
+	seenErr := map[string]bool{}
 	var findings []finding
 	var errs []string
 	dec := json.NewDecoder(r)
@@ -256,7 +356,11 @@ func parseVetJSON(r io.Reader) ([]finding, []string, error) {
 						Error string `json:"error"`
 					}
 					if json.Unmarshal(raw, &e) == nil && e.Error != "" {
-						errs = append(errs, fmt.Sprintf("%s: %s: %s", pkg, name, e.Error))
+						// Every analyzer reports the same config error, so report each cause once.
+						if !seenErr[e.Error] {
+							seenErr[e.Error] = true
+							errs = append(errs, fmt.Sprintf("%s: %s: %s", pkg, name, e.Error))
+						}
 						continue
 					}
 					return nil, nil, err

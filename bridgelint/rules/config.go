@@ -1,6 +1,7 @@
 package rules
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -22,6 +23,8 @@ type Config struct {
 	LoginMappers []string `yaml:"login_mappers"`
 	// Classifiers are functions that extract a typed code from an error (MSS006).
 	Classifiers []string `yaml:"classifiers"`
+	// AuthErrors are the library's rejected-session sentinels, bare or package-qualified (BS010, BS011).
+	AuthErrors []string `yaml:"auth_errors"`
 	// DisconnectEvents maps a library import path to the event types that signal a disconnect (BS009).
 	DisconnectEvents map[string][]string `yaml:"disconnect_events"`
 	// NetworkPackages are import path prefixes whose functions all count as reaching the network, for
@@ -47,6 +50,7 @@ var ConfigOverride string
 
 var (
 	configCache   = map[string]*Config{}
+	configErrs    = map[string]error{}
 	configCacheMu sync.Mutex
 )
 
@@ -54,7 +58,7 @@ func defaultConfig() *Config {
 	return &Config{HelperDepth: 3, DisconnectEvents: DefaultDisconnectEvents}
 }
 
-func LoadConfig(dir string) *Config {
+func LoadConfig(dir string) (*Config, error) {
 	path := ConfigOverride
 	if path == "" {
 		path = findConfig(dir)
@@ -62,7 +66,7 @@ func LoadConfig(dir string) *Config {
 	configCacheMu.Lock()
 	defer configCacheMu.Unlock()
 	if cfg, ok := configCache[path]; ok {
-		return cfg
+		return cfg, configErrs[path]
 	}
 	cfg := defaultConfig()
 	if path != "" {
@@ -71,7 +75,9 @@ func LoadConfig(dir string) *Config {
 			err = yaml.Unmarshal(data, cfg)
 		}
 		if err != nil {
-			panic("bridgelint: failed to read " + path + ": " + err.Error())
+			err = fmt.Errorf("reading %s: %w", path, err)
+			configCache[path], configErrs[path] = cfg, err
+			return cfg, err
 		}
 		if cfg.HelperDepth <= 0 {
 			cfg.HelperDepth = 3
@@ -85,7 +91,7 @@ func LoadConfig(dir string) *Config {
 		cfg.disabledSet[id] = struct{}{}
 	}
 	configCache[path] = cfg
-	return cfg
+	return cfg, nil
 }
 
 func findConfig(dir string) string {

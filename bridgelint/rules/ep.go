@@ -15,6 +15,9 @@ var EPAnalyzer = &analysis.Analyzer{
 }
 
 func runEP(pass *analysis.Pass) (any, error) {
+	if err := ConfigError(pass); err != nil {
+		return nil, err
+	}
 	pi := infoFor(pass)
 	info := pass.TypesInfo
 	isErrText := func(e ast.Expr) bool {
@@ -74,15 +77,7 @@ func isHTTPResponseStatus(info *types.Info, e ast.Expr) bool {
 		return false
 	}
 	selection, ok := info.Selections[sel]
-	if !ok || selection.Kind() != types.FieldVal {
-		return false
-	}
-	t := selection.Recv()
-	if ptr, ok := t.(*types.Pointer); ok {
-		t = ptr.Elem()
-	}
-	named, ok := types.Unalias(t).(*types.Named)
-	return ok && named.Obj().Name() == "Response"
+	return ok && selection.Kind() == types.FieldVal && isHTTPStruct(selection.Recv(), "Response")
 }
 
 func containsErrorsJoin(pass *analysis.Pass, e ast.Expr) bool {

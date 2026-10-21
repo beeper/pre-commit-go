@@ -16,6 +16,7 @@ const (
 	pathBridgev2 = "maunium.net/go/mautrix/bridgev2"
 	pathStatus   = "maunium.net/go/mautrix/bridgev2/status"
 	pathEvent    = "maunium.net/go/mautrix/event"
+	pathZerolog  = "github.com/rs/zerolog"
 )
 
 type Scope uint8
@@ -43,14 +44,12 @@ var lifecycleMethods = map[string]bool{
 
 // pkgInfo is shared by every analyzer that runs on the same package.
 type pkgInfo struct {
-	pass      *analysis.Pass
-	bridgev2  *types.Package
-	isBridge  bool
-	decls     map[*types.Func]*ast.FuncDecl
-	scopes    map[*ast.FuncDecl]Scope
-	goTargets map[*ast.FuncDecl]bool
-	goLits    []*ast.FuncLit
-	parents   map[ast.Node]ast.Node
+	pass     *analysis.Pass
+	bridgev2 *types.Package
+	isBridge bool
+	decls    map[*types.Func]*ast.FuncDecl
+	scopes   map[*ast.FuncDecl]Scope
+	parents  map[ast.Node]ast.Node
 }
 
 var pkgInfos sync.Map // *types.Package -> *pkgInfo
@@ -66,11 +65,10 @@ func infoFor(pass *analysis.Pass) *pkgInfo {
 
 func buildInfo(pass *analysis.Pass) *pkgInfo {
 	pi := &pkgInfo{
-		pass:      pass,
-		decls:     map[*types.Func]*ast.FuncDecl{},
-		scopes:    map[*ast.FuncDecl]Scope{},
-		goTargets: map[*ast.FuncDecl]bool{},
-		parents:   map[ast.Node]ast.Node{},
+		pass:    pass,
+		decls:   map[*types.Func]*ast.FuncDecl{},
+		scopes:  map[*ast.FuncDecl]Scope{},
+		parents: map[ast.Node]ast.Node{},
 	}
 	for _, imp := range pass.Pkg.Imports() {
 		if imp.Path() == pathBridgev2 {
@@ -103,28 +101,6 @@ func buildInfo(pass *analysis.Pass) *pkgInfo {
 	}
 	if pi.isBridge {
 		pi.classify()
-	}
-	for _, f := range pass.Files {
-		ast.Inspect(f, func(n ast.Node) bool {
-			gs, ok := n.(*ast.GoStmt)
-			if !ok {
-				return true
-			}
-			if lit, ok := gs.Call.Fun.(*ast.FuncLit); ok {
-				pi.goLits = append(pi.goLits, lit)
-				ast.Inspect(lit.Body, func(n ast.Node) bool {
-					if call, ok := n.(*ast.CallExpr); ok {
-						if fd := pi.declOf(call); fd != nil {
-							pi.goTargets[fd] = true
-						}
-					}
-					return true
-				})
-			} else if fd := pi.declOf(gs.Call); fd != nil {
-				pi.goTargets[fd] = true
-			}
-			return true
-		})
 	}
 	return pi
 }
@@ -260,6 +236,19 @@ func isNamed(t types.Type, path, name string) bool {
 		return false
 	}
 	return n.Obj().Pkg().Path() == path && n.Obj().Name() == name
+}
+
+// isHTTPStruct reports whether t, after dropping a pointer, is a named type called name. The package
+// isn't checked: net/http forks like fhttp declare their own Request and Response.
+func isHTTPStruct(t types.Type, name string) bool {
+	if t == nil {
+		return false
+	}
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+	named, ok := types.Unalias(t).(*types.Named)
+	return ok && named.Obj().Name() == name
 }
 
 var errorType = types.Universe.Lookup("error").Type().Underlying().(*types.Interface)

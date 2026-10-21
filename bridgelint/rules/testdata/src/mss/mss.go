@@ -114,7 +114,7 @@ func suppressed(err error) error {
 }
 
 func bareIgnore(err error) error {
-	//bridgelint:ignore because I said so // want `BL000: bridgelint:ignore must name the rules`
+	//bridgelint:ignore because I said so
 	return bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusTooOld) // want `MSS002`
 }
 

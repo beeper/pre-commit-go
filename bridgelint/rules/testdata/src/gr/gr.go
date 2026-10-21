@@ -3,11 +3,15 @@ package gr
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"example.com/netlib"
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
 )
@@ -26,6 +30,14 @@ type Meta struct{ Cursor string }
 var _ bridgev2.NetworkAPI = (*Client)(nil)
 
 var sharedCaps = map[string]bool{}
+
+// A map whose values synchronise themselves is still one map shared by every login.
+var sharedCounts = map[string]*atomic.Int64{}
+
+var (
+	sharedState sync.Map
+	sharedMu    sync.Mutex
+)
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
@@ -79,6 +91,28 @@ func (c *Client) die(err error) {
 	panic("unreachable")
 }
 
+func (c *Client) logAndDie(log zerolog.Logger, err error) {
+	log.Fatal().Err(err).Msg("Giving up") // want `GR004: zerolog Fatal\(\) exits the process`
+	log.Error().Err(err).Msg("Carrying on")
+}
+
+// retryReplayable sets GetBody, so the body survives a retry and GR003 stays quiet.
+func (c *Client) retryReplayable(ctx context.Context, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.com", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+	for i := 0; i < 3; i++ {
+		resp, err := httpClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			return nil
+		}
+	}
+	return nil
+}
+
 func MustParse(s string) string {
 	if s == "" {
 		panic("empty")
@@ -95,7 +129,11 @@ func (c *Client) sync(ctx context.Context) {
 }
 
 func (c *Client) remember(k string) {
-	sharedCaps[k] = true // want `GR009: package-level sharedCaps is written at runtime`
+	sharedCaps[k] = true              // want `GR009: package-level sharedCaps is written at runtime`
+	sharedCounts[k] = &atomic.Int64{} // want `GR009: package-level sharedCounts is written at runtime`
+	sharedState.Store(k, true)
+	sharedMu.Lock()
+	defer sharedMu.Unlock()
 	c.cache[k] = "v"
 	c.pending[k] = true
 	delete(c.pending, k)

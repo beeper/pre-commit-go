@@ -53,6 +53,49 @@ func TestGR(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), GRAnalyzer, "gr")
 }
 
+func TestBL(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), BLAnalyzer, "bl")
+}
+
+// A reasonless ignore can't be covered by analysistest: the `// want` text on the directive's own line
+// would be read as the reason.
+func TestParseIgnore(t *testing.T) {
+	cases := []struct {
+		text   string
+		rules  []string
+		reason string
+	}{
+		{text: "// just a comment"},
+		{text: "//bridgelint:ignore MSS002 the reason", rules: []string{"MSS002"}, reason: "the reason"},
+		{text: "//bridgelint:ignore MSS002 BS004 two rules", rules: []string{"MSS002", "BS004"}, reason: "two rules"},
+		{text: "//bridgelint:ignore all everything here", rules: []string{"all"}, reason: "everything here"},
+		{text: "//bridgelint:ignore MSS002", rules: []string{"MSS002"}},
+		{text: "//bridgelint:ignore because I said so", reason: "because I said so"},
+		{text: "//bridgelint:ignore"},
+	}
+	for _, c := range cases {
+		entry := parseIgnore(c.text)
+		if entry == nil {
+			if c.rules != nil || c.reason != "" {
+				t.Errorf("parseIgnore(%q) = nil, want rules %v reason %q", c.text, c.rules, c.reason)
+			}
+			continue
+		}
+		if entry.reason != c.reason {
+			t.Errorf("parseIgnore(%q) reason = %q, want %q", c.text, entry.reason, c.reason)
+		}
+		if len(entry.rules) != len(c.rules) {
+			t.Errorf("parseIgnore(%q) rules = %v, want %v", c.text, entry.rules, c.rules)
+			continue
+		}
+		for _, want := range c.rules {
+			if _, ok := entry.rules[want]; !ok {
+				t.Errorf("parseIgnore(%q) rules = %v, missing %q", c.text, entry.rules, want)
+			}
+		}
+	}
+}
+
 func TestWrapVerbArgs(t *testing.T) {
 	cases := map[string][]int{
 		"x: %w":          {0},
@@ -60,6 +103,11 @@ func TestWrapVerbArgs(t *testing.T) {
 		"100%% %v %w %w": {1, 2},
 		"%*d %w":         {2},
 		"no verbs":       nil,
+		"%[2]w":          {1},
+		"a %s: %[1]w":    {0},
+		"%v %[1]w %w":    {0, 1},
+		"%[w":            nil,
+		"%[0]w":          nil, // an index must be 1-based; fmt rejects this, so nothing is wrapped
 	}
 	for format, want := range cases {
 		got := wrapVerbArgs(format)

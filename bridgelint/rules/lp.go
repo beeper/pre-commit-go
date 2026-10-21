@@ -77,6 +77,9 @@ func runLP(pass *analysis.Pass) (any, error) {
 	if len(pass.Files) == 0 {
 		return nil, nil
 	}
+	if err := ConfigError(pass); err != nil {
+		return nil, err
+	}
 	pi := infoFor(pass)
 	cfg := ConfigFor(pass)
 	ef := newErrFlow(pass, pi, cfg, cfg.LoginMappers).withFacts(pass, newLPFact)
@@ -178,7 +181,7 @@ func checkRespErrLit(pass *analysis.Pass, pi *pkgInfo, file *ast.File, lit *ast.
 	}
 
 	// LP004
-	if re.status != nil && !re.statusKnow && isPassthroughStatus(info, re.status) {
+	if re.status != nil && !re.statusKnow && isPassthroughStatus(pass, re.status) {
 		report(pass, re.status, LP004, "HTTP status copied from a network error code; map it to a fixed status (400 with M_LIMIT_EXCEEDED for rate limits, 401/403 for auth, 500 for upstream)")
 	}
 
@@ -253,19 +256,17 @@ func lp007Fix(pass *analysis.Pass, file *ast.File, re *respErr, varName string, 
 	return withFix("Use mautrix."+varName, analysis.TextEdit{Pos: re.lit.Pos(), End: re.lit.End(), NewText: []byte(text)}), true
 }
 
-func isPassthroughStatus(info *types.Info, e ast.Expr) bool {
+// isPassthroughStatus reports whether e is a network status code being used as the HTTP status, through
+// a conversion like int(te.Code) if there is one.
+func isPassthroughStatus(pass *analysis.Pass, e ast.Expr) bool {
+	info := pass.TypesInfo
 	e = unparen(e)
 	if call, ok := e.(*ast.CallExpr); ok {
 		if tv, ok := info.Types[call.Fun]; ok && tv.IsType() && len(call.Args) == 1 {
 			e = unparen(call.Args[0])
 		}
 	}
-	sel, ok := e.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-	name := strings.ToLower(sel.Sel.Name)
-	return strings.Contains(name, "code") || strings.Contains(name, "status")
+	return isNetworkStatusField(netOf(pass), info, e)
 }
 
 // checkRespErrCall handles mautrix.MX.WithStatus(...) chains and WrapRespErrManual (LP002, LP004).
@@ -275,7 +276,7 @@ func checkRespErrCall(pass *analysis.Pass, pi *pkgInfo, file *ast.File, call *as
 		code, _ := constString(info, call.Args[1])
 		if v, ok := constInt(info, call.Args[2]); ok {
 			checkStatusArg(pass, file, call.Args[2], v, code == "M_LIMIT_EXCEEDED")
-		} else if isPassthroughStatus(info, call.Args[2]) {
+		} else if isPassthroughStatus(pass, call.Args[2]) {
 			report(pass, call.Args[2], LP004, "HTTP status copied from a network error code; map it to a fixed status")
 		}
 		return
@@ -286,7 +287,7 @@ func checkRespErrCall(pass *analysis.Pass, pi *pkgInfo, file *ast.File, call *as
 	}
 	v, known := constInt(info, call.Args[0])
 	if !known {
-		if isPassthroughStatus(info, call.Args[0]) {
+		if isPassthroughStatus(pass, call.Args[0]) {
 			report(pass, call.Args[0], LP004, "HTTP status copied from a network error code; map it to a fixed status")
 		}
 		return
