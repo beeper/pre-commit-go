@@ -121,7 +121,7 @@ func checkStatusChain(pass *analysis.Pass, ef *errFlow, c *statusChain) {
 			report(pass, c.node(), MSS003, "WithErrorAsMessage shows an errors.Join result to users")
 		}
 	}
-	if m, ok := c.message(); ok && exprShowsError(info, m) {
+	if m, ok := c.message(); ok && exprShowsError(pass.Pkg, info, m) {
 		report(pass, m, MSS003, "status message is built from raw error text; use a fixed human string and keep the error as InternalError")
 	}
 
@@ -148,14 +148,14 @@ func checkMissingReason(pass *analysis.Pass, c *statusChain) {
 }
 
 // exprShowsError reports whether e turns an error into text: err.Error(), fmt.Sprint*(..., err).
-func exprShowsError(info *types.Info, e ast.Expr) bool {
+func exprShowsError(pkg *types.Package, info *types.Info, e ast.Expr) bool {
 	found := false
 	ast.Inspect(e, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok || found {
 			return !found
 		}
-		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Error" && len(call.Args) == 0 && isErrorType(info.TypeOf(sel.X)) {
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Error" && len(call.Args) == 0 && isErrorType(info.TypeOf(sel.X)) && !isLocalErrorType(pkg, info.TypeOf(sel.X)) {
 			found = true
 			return false
 		}
@@ -309,4 +309,17 @@ func hasReceiveCase(pi *pkgInfo, cc *ast.CommClause) bool {
 		}
 	}
 	return false
+}
+
+// isLocalErrorType reports whether t is a concrete error type declared in pkg. Its Error method is the
+// bridge's own text (often a fixed user-facing notice), not a raw error from a library.
+func isLocalErrorType(pkg *types.Package, t types.Type) bool {
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+	named, ok := t.(*types.Named)
+	if !ok || types.IsInterface(named) {
+		return false
+	}
+	return named.Obj().Pkg() == pkg
 }

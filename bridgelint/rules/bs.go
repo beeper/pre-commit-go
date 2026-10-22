@@ -225,7 +225,7 @@ func checkStateLit(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, s
 	}
 
 	// BS003
-	if msg, ok := sl.fields["Message"]; ok && exprShowsError(info, msg) {
+	if msg, ok := sl.fields["Message"]; ok && exprShowsError(pass.Pkg, info, msg) {
 		var opts []reportOpt
 		note := "move the raw error to Info[\"go_error\"] and write a human message"
 		if sl.codeOK && keys[sl.code] {

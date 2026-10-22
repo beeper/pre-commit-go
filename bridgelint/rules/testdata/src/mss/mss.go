@@ -133,3 +133,12 @@ func (c *Client) HandleMatrixReadReceipt(ctx context.Context, msg *bridgev2.Matr
 }
 
 var ErrNotLoggedIn = bridgev2.WrapErrorInStatus(fmt.Errorf("you're %w", errLocalSentinel)).WithErrorAsMessage()
+
+type userNotice string
+
+func (n userNotice) Error() string { return string(n) }
+
+func localNotice(err error) error {
+	notice := userNotice("remove it there first")
+	return bridgev2.WrapErrorInStatus(err).WithMessage(notice.Error()).WithErrorReason(event.MessageStatusUnsupported).WithStatus(event.MessageStatusFail)
+}
