@@ -1,0 +1,153 @@
+package rules
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+
+	"gopkg.in/yaml.v3"
+)
+
+const ConfigFileName = ".bridgelint.yaml"
+
+// Config is read from the nearest .bridgelint.yaml above the package directory.
+type Config struct {
+	// ErrorPrefix is the network prefix for bridge state codes (BS004), e.g. "slack".
+	ErrorPrefix string `yaml:"error_prefix"`
+	// CodeFormatAllowlist lists fmt.Sprintf formats allowed to build state codes (BS004).
+	CodeFormatAllowlist []string `yaml:"code_format_allowlist"`
+	// StatusMappers are functions that turn errors into message statuses (MSS001).
+	StatusMappers []string `yaml:"status_mappers"`
+	// LoginMappers are functions that turn errors into RespErrors (LP001).
+	LoginMappers []string `yaml:"login_mappers"`
+	// Classifiers are functions that extract a typed code from an error (MSS006).
+	Classifiers []string `yaml:"classifiers"`
+	// AuthErrors are the library's rejected-session sentinels, bare or package-qualified (BS010, BS011).
+	AuthErrors []string `yaml:"auth_errors"`
+	// DisconnectEvents maps a library import path to the event types that signal a disconnect (BS009).
+	DisconnectEvents map[string][]string `yaml:"disconnect_events"`
+	// NetworkPackages are import path prefixes whose functions all count as reaching the network, for
+	// libraries whose network I/O can't be followed.
+	NetworkPackages []string `yaml:"network_packages"`
+	// HelperDepth is how far errors are followed through same-package helpers.
+	HelperDepth int `yaml:"helper_depth"`
+	// Disable turns rules off entirely.
+	Disable []string `yaml:"disable"`
+	// Severity overrides the default severity of a rule.
+	Severity map[string]string `yaml:"severity"`
+
+	disabledSet map[string]struct{}
+}
+
+var DefaultDisconnectEvents = map[string][]string{
+	"github.com/bwmarrin/discordgo": {"*Disconnect"},
+	"github.com/slack-go/slack":     {"*DisconnectedEvent", "*FatalConnectionErrorEvent"},
+}
+
+// ConfigOverride, when set, is used instead of searching for .bridgelint.yaml.
+var ConfigOverride string
+
+var (
+	configCache   = map[string]*Config{}
+	configErrs    = map[string]error{}
+	configCacheMu sync.Mutex
+)
+
+func defaultConfig() *Config {
+	return &Config{HelperDepth: 3, DisconnectEvents: maps.Clone(DefaultDisconnectEvents)}
+}
+
+func LoadConfig(dir string) (*Config, error) {
+	path := ConfigOverride
+	if path == "" {
+		path = findConfig(dir)
+	}
+	configCacheMu.Lock()
+	defer configCacheMu.Unlock()
+	if cfg, ok := configCache[path]; ok {
+		return cfg, configErrs[path]
+	}
+	cfg := defaultConfig()
+	if path != "" {
+		if err := readConfig(path, cfg); err != nil {
+			err = fmt.Errorf("reading %s: %w", path, err)
+			configCache[path], configErrs[path] = cfg, err
+			return cfg, err
+		}
+		if cfg.HelperDepth <= 0 {
+			cfg.HelperDepth = 3
+		}
+		if cfg.DisconnectEvents == nil {
+			cfg.DisconnectEvents = maps.Clone(DefaultDisconnectEvents)
+		}
+	}
+	cfg.disabledSet = map[string]struct{}{}
+	for _, id := range cfg.Disable {
+		cfg.disabledSet[id] = struct{}{}
+	}
+	configCache[path] = cfg
+	return cfg, nil
+}
+
+// readConfig decodes the file at path into cfg. Unknown keys, rule IDs and severities are errors, so a
+// typo can't silently leave a rule as it was.
+func readConfig(path string, cfg *Config) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	dec := yaml.NewDecoder(f)
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	for _, id := range cfg.Disable {
+		if _, ok := Rules[id]; !ok {
+			return fmt.Errorf("disable: unknown rule %s", id)
+		}
+	}
+	for _, id := range slices.Sorted(maps.Keys(cfg.Severity)) {
+		if _, ok := Rules[id]; !ok {
+			return fmt.Errorf("severity: unknown rule %s", id)
+		}
+		if _, ok := ParseSeverity(cfg.Severity[id]); !ok {
+			return fmt.Errorf("severity: %s for %s must be error, warning or info", cfg.Severity[id], id)
+		}
+	}
+	return nil
+}
+
+func findConfig(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return ""
+	}
+	for {
+		candidate := filepath.Join(dir, ConfigFileName)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return ""
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+func (c *Config) disabled(id string) bool {
+	_, ok := c.disabledSet[id]
+	return ok
+}
