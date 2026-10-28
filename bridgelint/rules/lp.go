@@ -177,7 +177,7 @@ func checkRespErrLit(pass *analysis.Pass, pi *pkgInfo, file *ast.File, lit *ast.
 	info := pass.TypesInfo
 	re := parseRespErrLit(info, lit)
 	// LP002
-	if re.statusKnow && !isTrue(info, re.fields["CanRetry"]) && !explicitlyRetriable(pi, info, lit) {
+	if re.statusKnow && !isTrue(info, re.fields["CanRetry"]) && !retriesWanted(pi, info, lit) {
 		checkStatusArg(pass, file, re.status, re.statusVal, re.code == "M_LIMIT_EXCEEDED")
 	}
 
@@ -291,7 +291,7 @@ func lp007Fix(pass *analysis.Pass, pi *pkgInfo, file *ast.File, re *respErr, var
 	}
 	sends429 := re.status == nil && defaultStatus == 429 || re.statusKnow && re.statusVal == 429
 	switch {
-	case re.code == "M_LIMIT_EXCEEDED" && sends429 && !explicitlyRetriable(pi, pass.TypesInfo, re.lit):
+	case re.code == "M_LIMIT_EXCEEDED" && sends429 && !retriesWanted(pi, pass.TypesInfo, re.lit):
 		// mautrix.MLimitExceeded is 429, which LP002 rejects.
 		b.WriteString(".WithStatus(" + statusBadRequest(file) + ")")
 	case re.status != nil && !(re.statusKnow && re.statusVal == int64(defaultStatus)):
@@ -327,7 +327,9 @@ func checkRespErrCall(pass *analysis.Pass, pi *pkgInfo, file *ast.File, call *as
 	if isPkgFunc(calleeObj(info, call), pathBridgev2, "WrapRespErrManual") && len(call.Args) == 3 {
 		code, _ := constString(info, call.Args[1])
 		if v, ok := constInt(info, call.Args[2]); ok {
-			checkStatusArg(pass, file, call.Args[2], v, code == "M_LIMIT_EXCEEDED")
+			if !retriesWanted(pi, info, call) {
+				checkStatusArg(pass, file, call.Args[2], v, code == "M_LIMIT_EXCEEDED")
+			}
 		} else if isPassthroughStatus(pass, call.Args[2]) {
 			report(pass, call.Args[2], LP004, "HTTP status copied from a network error code; map it to a fixed status")
 		}
@@ -344,7 +346,7 @@ func checkRespErrCall(pass *analysis.Pass, pi *pkgInfo, file *ast.File, call *as
 		}
 		return
 	}
-	if explicitlyRetriable(pi, info, call) {
+	if retriesWanted(pi, info, call) {
 		return
 	}
 	isLimit := false
@@ -403,7 +405,7 @@ func checkDefaultLimitExceeded(pass *analysis.Pass, pi *pkgInfo, file *ast.File,
 			converted = true
 		}
 	}
-	if methods == 0 && !converted || explicitlyRetriable(pi, pass.TypesInfo, outer) {
+	if methods == 0 && !converted || retriesWanted(pi, pass.TypesInfo, outer) {
 		return
 	}
 	report(pass, outer, LP002, "mautrix.MLimitExceeded is sent as HTTP 429 by default, which clients retry automatically; add WithStatus(400)",
@@ -546,10 +548,18 @@ func loginFieldPatterns(pass *analysis.Pass) map[string]bool {
 	return out
 }
 
-// explicitlyRetriable reports whether the RespError expression e is part of a method chain that calls
-// WithCanRetry(true). That marks a deliberate retry (e.g. direct media waiting on a phone), not a
-// provisioning failure.
-func explicitlyRetriable(pi *pkgInfo, info *types.Info, e ast.Expr) bool {
+// retriesWanted reports whether the RespError expression e is in a direct media Download, or part of a
+// method chain that calls WithCanRetry(true). Media fetches are safe to retry, and WithCanRetry(true)
+// marks a deliberate retry (e.g. direct media waiting on a phone), not a provisioning failure.
+func retriesWanted(pi *pkgInfo, info *types.Info, e ast.Expr) bool {
+	for p := pi.parents[e]; p != nil; p = pi.parents[p] {
+		if fd, ok := p.(*ast.FuncDecl); ok {
+			if pi.scopes[fd]&ScopeDirectMedia != 0 {
+				return true
+			}
+			break
+		}
+	}
 	isCanRetry := func(call *ast.CallExpr, sel *ast.SelectorExpr) bool {
 		return sel.Sel.Name == "WithCanRetry" && len(call.Args) == 1 && isTrue(info, call.Args[0])
 	}

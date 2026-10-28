@@ -18,7 +18,11 @@ type errSummary struct {
 	CalleePkg  string // package name of the raw origin, for messages
 	CalleeName string // function name of the raw origin, for messages
 	FormatsErr bool
-	Statuses   bool // the function returns bridgev2 statuses itself, so its errors are meant for the bridge
+	// FormatsStatus is set when the error formats a network status code into its text.
+	FormatsStatus bool
+	// Typed is set when the raw origin is a value of a network library's own error type.
+	Typed    bool
+	Statuses bool // the function returns bridgev2 statuses itself, so its errors are meant for the bridge
 	// Complete is set when every error the function returns was classified, so Kind says everything it
 	// can return.
 	Complete bool
@@ -33,18 +37,22 @@ func (s errSummary) String() string {
 type mssErrFact struct{ S errSummary }
 type lpErrFact struct{ S errSummary }
 type bsErrFact struct{ S errSummary }
+type dmErrFact struct{ S errSummary }
 
 func (*mssErrFact) AFact() {}
 func (*lpErrFact) AFact()  {}
 func (*bsErrFact) AFact()  {}
+func (*dmErrFact) AFact()  {}
 
 func (f *mssErrFact) String() string { return f.S.String() }
 func (f *lpErrFact) String() string  { return f.S.String() }
 func (f *bsErrFact) String() string  { return f.S.String() }
+func (f *dmErrFact) String() string  { return f.S.String() }
 
 func (f *mssErrFact) summary() *errSummary { return &f.S }
 func (f *lpErrFact) summary() *errSummary  { return &f.S }
 func (f *bsErrFact) summary() *errSummary  { return &f.S }
+func (f *dmErrFact) summary() *errSummary  { return &f.S }
 
 type errFact interface {
 	analysis.Fact
@@ -54,6 +62,7 @@ type errFact interface {
 func newMSSFact() errFact { return new(mssErrFact) }
 func newLPFact() errFact  { return new(lpErrFact) }
 func newBSFact() errFact  { return new(bsErrFact) }
+func newDMFact() errFact  { return new(dmErrFact) }
 
 // withFacts makes ef import summaries for functions in other packages of the module, and exports
 // summaries for every function in this package that returns an error.
@@ -77,7 +86,7 @@ func (ef *errFlow) withFacts(pass *analysis.Pass, newFact func() errFact) *errFl
 		s.Statuses = ef.returnsStatuses(fd, sig, idx)
 		o := ef.funcOrigin(fd, idx, ef.cfg.HelperDepth)
 		if o.bad() {
-			s.Kind, s.Msg, s.FormatsErr = o.kind, o.msg, o.formatsErr
+			s.Kind, s.Msg, s.FormatsErr, s.FormatsStatus, s.Typed = o.kind, o.msg, o.formatsErr, o.formatsStatus, o.typed
 			s.CalleePkg, s.CalleeName = o.calleePkgName(), o.calleeFuncName()
 		}
 		s.Complete = o.kind != errUnknown && !o.partial
@@ -160,6 +169,11 @@ func (ef *errFlow) importedOrigin(f *types.Func, call *ast.CallExpr) errOrigin {
 		// ErrUploadFailed.
 		switch {
 		case s.Kind == errRaw, s.Kind == errConstructed && s.CalleeName != "":
+			// A library's own error type is also how parsers fail, so it only counts from a function
+			// that reaches the network.
+			if s.Typed && !ef.net.mightReach(f, true) {
+				return errOrigin{kind: errInternal}
+			}
 			return errOrigin{kind: errRaw, node: call, callee: f}
 		case s.Complete && !s.FormatsErr:
 			return errOrigin{kind: errInternal}
@@ -173,13 +187,15 @@ func (ef *errFlow) importedOrigin(f *types.Func, call *ast.CallExpr) errOrigin {
 		kind = errInternal
 	}
 	return errOrigin{
-		kind:       kind,
-		partial:    !s.Complete,
-		node:       call,
-		msg:        s.Msg,
-		calleePkg:  s.CalleePkg,
-		calleeFn:   s.CalleeName,
-		formatsErr: s.FormatsErr,
-		via:        f.Pkg().Name() + "." + f.Name(),
+		kind:          kind,
+		partial:       !s.Complete,
+		node:          call,
+		msg:           s.Msg,
+		calleePkg:     s.CalleePkg,
+		calleeFn:      s.CalleeName,
+		formatsErr:    s.FormatsErr,
+		formatsStatus: s.FormatsStatus,
+		typed:         s.Typed,
+		via:           f.Pkg().Name() + "." + f.Name(),
 	}
 }

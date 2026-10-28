@@ -8,6 +8,7 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/mediaproxy"
 )
 
 type MessageStatus struct {
@@ -102,6 +103,12 @@ type IdentifierResolvingNetworkAPI interface {
 type NetworkConnector interface {
 	GetLoginFlows() []LoginFlow
 	CreateLogin(ctx context.Context, user any, flowID string) (LoginProcess, error)
+}
+
+type DirectMediableNetwork interface {
+	NetworkConnector
+	SetUseDirectMedia()
+	Download(ctx context.Context, mediaID string, params map[string]string) (mediaproxy.GetMediaResponse, error)
 }
 
 type LoginProcess interface {

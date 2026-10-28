@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	pathMautrix  = "maunium.net/go/mautrix"
-	pathBridgev2 = "maunium.net/go/mautrix/bridgev2"
-	pathStatus   = "maunium.net/go/mautrix/bridgev2/status"
-	pathEvent    = "maunium.net/go/mautrix/event"
-	pathZerolog  = "github.com/rs/zerolog"
+	pathMautrix    = "maunium.net/go/mautrix"
+	pathBridgev2   = "maunium.net/go/mautrix/bridgev2"
+	pathStatus     = "maunium.net/go/mautrix/bridgev2/status"
+	pathEvent      = "maunium.net/go/mautrix/event"
+	pathMediaproxy = "maunium.net/go/mautrix/mediaproxy"
+	pathZerolog    = "github.com/rs/zerolog"
 )
 
 type Scope uint8
@@ -27,6 +28,7 @@ const (
 	ScopeLogin
 	ScopeProvisioning
 	ScopeLifecycle
+	ScopeDirectMedia
 )
 
 var provisioningMethods = map[string]bool{
@@ -137,6 +139,7 @@ func (pi *pkgInfo) classify() {
 	networkAPI := pi.lookupIface("NetworkAPI")
 	networkConnector := pi.lookupIface("NetworkConnector")
 	loginProcess := pi.lookupIface("LoginProcess")
+	directMediable := pi.lookupIface("DirectMediableNetwork")
 	loginMethods := map[string]bool{}
 	for _, name := range pi.bridgev2.Scope().Names() {
 		if !strings.HasPrefix(name, "LoginProcess") {
@@ -171,6 +174,9 @@ func (pi *pkgInfo) classify() {
 		}
 		if implements(recv, networkConnector) && name == "CreateLogin" {
 			scope |= ScopeLogin
+		}
+		if implements(recv, directMediable) && name == "Download" {
+			scope |= ScopeDirectMedia
 		}
 		if scope != 0 {
 			pi.scopes[fd] = scope

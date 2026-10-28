@@ -67,6 +67,9 @@ var (
 	LP007 = rule("LP007", SeverityInfo, "RespError struct literal for a standard Matrix error code")
 	LP008 = rule("LP008", SeverityInfo, "connector re-validates input the login step already describes")
 
+	DM001 = rule("DM001", SeverityError, "library error from direct media Download")
+	DM002 = rule("DM002", SeverityWarning, "plain error built from an upstream status in direct media Download")
+
 	EP001 = rule("EP001", SeverityError, "matching errors by string")
 	EP002 = rule("EP002", SeverityWarning, "library error without a typed status")
 	EP003 = rule("EP003", SeverityInfo, "errors.Join in a user-facing path")

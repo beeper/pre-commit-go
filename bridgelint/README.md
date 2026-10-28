@@ -2,11 +2,12 @@
 
 `bridgelint` checks [mautrix bridgev2](https://pkg.go.dev/maunium.net/go/mautrix/bridgev2) bridges for
 error-reporting and reliability mistakes that tend to repeat across bridges: Matrix handlers that return
-bare errors, login errors that turn into a 500, bridge states with raw error text or the wrong user action,
-background loops that fail silently, and a few general Go reliability problems.
+bare errors, login errors that turn into a 500, direct media errors that turn into a 404, bridge states
+with raw error text or the wrong user action, background loops that fail silently, and a few general Go
+reliability problems.
 
 It's type-aware: functions are classified by the bridgev2 interface their receiver implements
-(`NetworkAPI`, `LoginProcess*`, `NetworkConnector`), not by name.
+(`NetworkAPI`, `LoginProcess*`, `NetworkConnector`, `DirectMediableNetwork`), not by name.
 
 It's a best-practices linter, so it prefers missing a problem to flagging correct code. Rules only fire
 on patterns that are wrong wherever they appear; heuristics that need knowledge of the protocol or the
@@ -191,7 +192,8 @@ Provisioning methods are `ResolveIdentifier`, `CreateGroup`, `CreateChatWithGhos
 Clients retry 429 and 502-504 automatically, and login and provisioning requests must not be retried
 behind the user's back, so `RespError`s never use those statuses. Rate limits are `M_LIMIT_EXCEEDED` with
 400, and upstream failures are 500. A chain that calls `WithCanRetry(true)` (direct media waiting on a
-phone, for example) asks for retries deliberately and isn't reported.
+phone, for example) asks for retries deliberately and isn't reported, and neither is a `RespError` in a
+direct media `Download`, which is safe to retry.
 
 | Rule | Severity | Flags |
 |---|---|---|
@@ -201,6 +203,52 @@ phone, for example) asks for retries deliberately and isn't reported.
 | LP005 | warning | A `RespError` literal without `StatusCode`, which is sent as 500. A literal passed as an `any` argument, like the body of `exhttp.WriteJSONResponse(w, status, body)`, isn't reported, since the writer sets the status. |
 | LP007 | info | A `RespError` literal for a standard Matrix code; use `mautrix.MLimitExceeded.WithMessage(...)` and friends so the status can't drift from the code. Autofix rewrites it (not `&RespError{...}`), with 400 for `M_LIMIT_EXCEEDED`. |
 | LP008 | info | A login method re-checks a submitted field against the same regex as the field's `Pattern`. |
+
+### Direct media (DM)
+
+Direct media is served by bridgev2's media proxy, which calls the `Download` method of the
+`DirectMediableNetwork` implementation and turns its error into the response: a `mautrix.RespError` is
+sent as is (so is a `bridgev2.RespError` since mautrix v0.32.0, but not a pointer to either), an error passing
+`exhttp.IsNetworkError` is sent as 502, and anything else as 404 "Media not found". Clients treat a 404
+as the media being gone for good, so an upstream 401, 429 or 503 returned as a plain or library error
+breaks the media permanently.
+
+Errors from an HTTP client (`Do`, `Get`, `Head`, `Post` and `PostForm` on a `Client` in net/http or a
+fork like fhttp, and net/http's `Get` and friends) are all `*url.Error`s, which the proxy sends as 502,
+so they can be returned as is or wrapped with `%w`. Errors from any other function that reaches the
+network are reported: a library call's error can be a transport error or an upstream rejection, and
+nothing at the return tells them apart. An error the function has already found not to be the
+library's error type isn't reported, in the branch of an `errors.As`/`errors.AsType` check that didn't
+match or after one whose matching branch returns: what's left is what the author chose to pass on. In
+a network library of the module (a package that doesn't import bridgev2), a value of the library's own
+error type counts as a library error when the function returning it reaches the network, since that's
+how status errors are usually returned. When the pinned mautrix is older than v0.32.0, the proxy sends
+transport errors as 404 too, and they're reported as well.
+
+The media proxy's own errors, like `mediaproxy.ErrInvalidMediaIDSyntax` for an ID that can't be parsed,
+aren't reported. Errors returned from a `GetMediaResponseFile` callback aren't checked: they're returned
+from a closure, and the proxy sends them as 500 rather than 404.
+
+Map upstream failures to fixed statuses, never the upstream one (LP004): a 401 from the homeserver
+means the client's own access token was rejected.
+
+| Upstream | Return from `Download` |
+|---|---|
+| 404 or 410, or media that's deleted or expired and can't be refreshed | `mautrix.MNotFound.WithMessage(...)` |
+| 401 or 403 | `mautrix.MForbidden.WithMessage(...)` |
+| 429 | `mautrix.MLimitExceeded.WithMessage(...).WithCanRetry(true)` |
+| 5xx or any other status | `mautrix.MUnknown.WithMessage(...).WithStatus(http.StatusBadGateway).WithCanRetry(true)` |
+| a wait that timed out, like a phone that didn't answer | `mautrix.MUnknown.WithMessage(...).WithStatus(http.StatusGatewayTimeout).WithCanRetry(true)` |
+| a transport error from an HTTP client | the error, as is or wrapped with `%w` |
+
+A media fetch is safe to retry, so the statuses clients retry automatically are the right ones here
+and LP002 doesn't apply inside `Download`. In a helper outside it, `WithCanRetry(true)` marks the retry
+as deliberate for LP002, and sets `com.beeper.can_retry` for clients.
+
+| Rule | Severity | Flags |
+|---|---|---|
+| DM001 | error | `Download` returns a network error unmapped: as is, or wrapped in `fmt.Errorf`, directly or through a same-package helper. Errors from an HTTP client aren't reported. |
+| DM002 | warning | `Download` returns a plain error that formats an upstream status (`fmt.Errorf("unexpected status %d", resp.StatusCode)`), which is sent as 404 whatever the status was. The status is a `Status`, `StatusCode` or `Code` field of an HTTP response or of a network library's type, recognised by name as for LP004. |
 
 ### Error plumbing (EP)
 

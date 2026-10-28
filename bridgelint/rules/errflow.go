@@ -31,6 +31,10 @@ type errOrigin struct {
 	helper *ast.FuncDecl
 	// formatsErr is set when a constructed error formats another error or a status code into its text.
 	formatsErr bool
+	// formatsStatus is set when a constructed error formats a network status code into its text.
+	formatsStatus bool
+	// typed is set when a raw origin is a value of a network library's own error type, named by callee.
+	typed bool
 	// calleePkg and calleeFn name the raw origin when it's only known from another package's summary.
 	calleePkg, calleeFn string
 	// via names the function in another package of the module that the error came through.
@@ -89,6 +93,11 @@ type errFlow struct {
 	modulePath string
 	net        *netReach
 	deferCache map[ast.Node]bool
+
+	// Set for direct media, where what matters is whether the media proxy can tell a transport error
+	// from an upstream rejection.
+	transportMapped bool
+	libErrorTypes   bool
 }
 
 func newErrFlow(pass *analysis.Pass, pi *pkgInfo, cfg *Config, mappers ...[]string) *errFlow {
@@ -97,6 +106,16 @@ func newErrFlow(pass *analysis.Pass, pi *pkgInfo, cfg *Config, mappers ...[]stri
 	for _, list := range mappers {
 		ef.mappers = append(ef.mappers, list...)
 	}
+	return ef
+}
+
+// forDirectMedia makes ef classify errors the way the media proxy sees them. Errors from an HTTP client
+// are transport errors, which it sends as 502 by itself (when the pinned mautrix does). Values of a
+// network library's own error types are library errors, since those carry the upstream status. An error
+// the function has already found not to be such a type is what the author chose to pass on.
+func (ef *errFlow) forDirectMedia() *errFlow {
+	ef.transportMapped = FrameworkHas(FeatureMediaProxyNetworkErrors)
+	ef.libErrorTypes = true
 	return ef
 }
 
@@ -356,6 +375,9 @@ func (ef *errFlow) classify(fn ast.Node, e ast.Expr, at token.Pos, depth int) er
 	e = unparen(e)
 	if t := ef.info.TypeOf(e); t != nil && !isErrorInterface(t) {
 		if _, isTuple := t.(*types.Tuple); !isTuple {
+			if tn := ef.libErrorType(t); tn != nil {
+				return errOrigin{kind: errRaw, node: e, callee: tn, typed: true}
+			}
 			return errOrigin{kind: errGood}
 		}
 	}
@@ -370,6 +392,9 @@ func (ef *errFlow) classify(fn ast.Node, e ast.Expr, at token.Pos, depth int) er
 		}
 		if v.Parent() == v.Pkg().Scope() {
 			return ef.classifyPkgVar(v, x, depth)
+		}
+		if ef.libErrorTypes && ef.ruledOutLibType(fn, x, v) {
+			return errOrigin{kind: errGood}
 		}
 		return ef.classifyLocal(fn, v, at, depth)
 	case *ast.SelectorExpr:
@@ -396,7 +421,8 @@ func (ef *errFlow) classifyPkgVar(v *types.Var, node ast.Node, depth int) errOri
 		}
 		return o
 	}
-	if ef.net.pkgReaches(v.Pkg()) {
+	// The media proxy maps its own errors itself.
+	if v.Pkg().Path() != pathMediaproxy && ef.net.pkgReaches(v.Pkg()) {
 		return errOrigin{kind: errRaw, node: node, callee: v}
 	}
 	return errOrigin{kind: errGood}
@@ -525,6 +551,9 @@ func (ef *errFlow) classifyCall(fn ast.Node, call *ast.CallExpr, idx, depth int)
 	// Errors from library functions that can reach the network are network errors; the rest (parsers,
 	// converters, local stores) are internal.
 	if ef.net.mightReach(f, false) {
+		if ef.transportMapped && isHTTPClientCall(f) {
+			return errOrigin{kind: errGood}
+		}
 		return errOrigin{kind: errRaw, node: call, callee: f}
 	}
 	return errOrigin{kind: errInternal}
@@ -595,8 +624,11 @@ func (ef *errFlow) classifyErrorf(fn ast.Node, call *ast.CallExpr, depth int) er
 	o := errOrigin{kind: errConstructed, node: call, msg: format}
 	for _, arg := range call.Args[1:] {
 		// Package-level sentinels have fixed text, so formatting one doesn't leak anything.
-		if t := ef.info.TypeOf(arg); isErrorType(t) && !ef.isPkgVar(arg) || isNetworkStatusField(ef.net, ef.info, arg) {
+		if t := ef.info.TypeOf(arg); isErrorType(t) && !ef.isPkgVar(arg) {
 			o.formatsErr = true
+		}
+		if isNetworkStatusField(ef.net, ef.info, arg) {
+			o.formatsErr, o.formatsStatus = true, true
 		}
 	}
 	if !ok {
@@ -620,8 +652,9 @@ func (ef *errFlow) classifyErrorf(fn ast.Node, call *ast.CallExpr, depth int) er
 			return errOrigin{kind: inner.kind, formatsErr: o.formatsErr, partial: inner.partial}
 		}
 		o.partial = o.partial || inner.partial
+		o.formatsStatus = o.formatsStatus || inner.formatsStatus
 		if inner.kind == errRaw {
-			o.callee, o.calleePkg, o.calleeFn, o.via = inner.callee, inner.calleePkg, inner.calleeFn, inner.via
+			o.callee, o.calleePkg, o.calleeFn, o.via, o.typed = inner.callee, inner.calleePkg, inner.calleeFn, inner.via, inner.typed
 		}
 	}
 	return o
@@ -747,7 +780,9 @@ func describeOrigin(fset *token.FileSet, o errOrigin) string {
 			s += fmt.Sprintf(" wrapping a raw %s error", o.calleePkgName())
 		}
 	case errRaw:
-		if o.hasCallee() {
+		if o.typed {
+			s = fmt.Sprintf("a %s.%s", o.calleePkgName(), o.calleeFuncName())
+		} else if o.hasCallee() {
 			s = fmt.Sprintf("raw error from %s.%s", o.calleePkgName(), o.calleeFuncName())
 		} else {
 			s = "raw library error"

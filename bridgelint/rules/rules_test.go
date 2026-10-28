@@ -92,6 +92,15 @@ func TestLP(t *testing.T) {
 	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), LPAnalyzer, "lp")
 }
 
+func TestDM(t *testing.T) {
+	defer func() { MautrixVersion = "" }()
+	MautrixVersion = "local"
+	analysistest.Run(t, analysistest.TestData(), DMAnalyzer, "dm")
+	analysistest.Run(t, filepath.Join(analysistest.TestData(), "dmmod"), DMAnalyzer, "./...")
+	MautrixVersion = "v0.31.0"
+	analysistest.Run(t, analysistest.TestData(), DMAnalyzer, "dmold")
+}
+
 func TestEP(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), EPAnalyzer, "ep", "epnetlib", "epmain")
 }

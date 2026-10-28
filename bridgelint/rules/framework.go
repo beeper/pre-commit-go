@@ -20,6 +20,8 @@ var (
 	FeatureReloginDefault = Feature{Since: time.Date(2026, 10, 19, 10, 47, 39, 0, time.UTC), LastTagWithout: "v0.32.0"}
 	// mautrix/go 5c03a378: UserLogin always calls Disconnect after LogoutRemote.
 	FeatureDisconnectAfterLogout = Feature{Since: time.Date(2026, 10, 19, 10, 41, 37, 0, time.UTC), LastTagWithout: "v0.32.0"}
+	// mautrix/go 69c19fed: the media proxy sends errors passing exhttp.IsNetworkError as 502 instead of 404.
+	FeatureMediaProxyNetworkErrors = Feature{Since: time.Date(2026, 10, 13, 12, 2, 0, 0, time.UTC), LastTagWithout: "v0.31.0"}
 )
 
 // MautrixVersion is the maunium.net/go/mautrix version of the module being linted, set by the driver.
