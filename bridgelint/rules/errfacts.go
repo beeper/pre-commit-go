@@ -29,7 +29,7 @@ type errSummary struct {
 }
 
 func (s errSummary) String() string {
-	kind := map[errKind]string{errConstructed: "constructed", errRaw: "raw", errJoin: "join"}[s.Kind]
+	kind := map[errKind]string{errConstructed: "constructed", errRaw: "raw", errJoin: "join", errUnrecognised: "unrecognised"}[s.Kind]
 	return fmt.Sprintf("%s msg=%q callee=%s.%s statuses=%t complete=%t", kind, s.Msg, s.CalleePkg, s.CalleeName, s.Statuses, s.Complete)
 }
 
@@ -161,6 +161,10 @@ func (ef *errFlow) importedOrigin(f *types.Func, call *ast.CallExpr) errOrigin {
 		return errOrigin{kind: errInternal}
 	}
 	s := fact.summary()
+	via := f.Pkg().Name() + "." + f.Name()
+	if s.Kind == errUnrecognised {
+		return errOrigin{kind: s.Kind, node: call, msg: s.Msg, calleePkg: s.CalleePkg, via: via}
+	}
 	if !s.Statuses {
 		// A library function: any network error escaping it is a library error as far as the bridge is
 		// concerned, even if the library wrapped it or built it itself. Errors the library builds without
@@ -196,6 +200,6 @@ func (ef *errFlow) importedOrigin(f *types.Func, call *ast.CallExpr) errOrigin {
 		formatsErr:    s.FormatsErr,
 		formatsStatus: s.FormatsStatus,
 		typed:         s.Typed,
-		via:           f.Pkg().Name() + "." + f.Name(),
+		via:           via,
 	}
 }

@@ -36,6 +36,8 @@ func (c *Connector) Download(ctx context.Context, mediaID string, params map[str
 			return nil, err
 		}
 		return &mediaproxy.GetMediaResponseData{Reader: body}, nil
+	case "missing":
+		return nil, medialib.Missing(key) // want `DM001: Download returns a \*mautrix.RespError \(via medialib.Missing at connector.go:\d+\), which the media proxy doesn't recognise`
 	}
 	body, err := c.lib.Download(ctx, key)
 	if err != nil {

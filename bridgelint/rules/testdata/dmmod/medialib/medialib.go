@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+
+	"maunium.net/go/mautrix"
 )
 
 type Client struct{ http *http.Client }
@@ -61,4 +63,8 @@ func ParseKey(key string) (string, error) { // want ParseKey:"raw .*callee=media
 		return "", &ParseError{Input: key}
 	}
 	return key, nil
+}
+
+func Missing(key string) error { // want Missing:"unrecognised .*mautrix.RespError"
+	return &mautrix.RespError{ErrCode: "M_NOT_FOUND", Err: "missing " + key, StatusCode: http.StatusNotFound}
 }

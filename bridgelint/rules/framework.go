@@ -22,6 +22,9 @@ var (
 	FeatureDisconnectAfterLogout = Feature{Since: time.Date(2026, 10, 19, 10, 41, 37, 0, time.UTC), LastTagWithout: "v0.32.0"}
 	// mautrix/go 69c19fed: the media proxy sends errors passing exhttp.IsNetworkError as 502 instead of 404.
 	FeatureMediaProxyNetworkErrors = Feature{Since: time.Date(2026, 10, 13, 12, 2, 0, 0, time.UTC), LastTagWithout: "v0.31.0"}
+	// mautrix/go 29f550d4: bridgev2.RespError has an As method that fills a mautrix.RespError, so the media
+	// proxy recognises it, as a value or a pointer.
+	FeatureBridgeRespErrorAs = Feature{Since: time.Date(2026, 10, 13, 11, 58, 38, 0, time.UTC), LastTagWithout: "v0.31.0"}
 )
 
 // MautrixVersion is the maunium.net/go/mautrix version of the module being linted, set by the driver.
@@ -47,4 +50,12 @@ func FrameworkHas(f Feature) bool {
 	default:
 		return semver.Compare(v, f.LastTagWithout) > 0
 	}
+}
+
+// FrameworkLacks reports whether the linted module's mautrix is known not to include f. Unknown versions
+// report false, so rules about older framework behaviour stay quiet rather than guess.
+func FrameworkLacks(f Feature) bool {
+	v := MautrixVersion
+	known := v == "local" || strings.HasPrefix(v, "local@") || semver.IsValid(v)
+	return known && !FrameworkHas(f)
 }

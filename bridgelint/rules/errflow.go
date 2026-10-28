@@ -15,12 +15,13 @@ import (
 type errKind int
 
 const (
-	errUnknown     errKind = iota // can't tell; never reported
-	errGood                       // typed error, status, RespError, mapper output or nil
-	errConstructed                // errors.New or fmt.Errorf without wrapping anything typed
-	errRaw                        // returned unchanged from a network or library call
-	errJoin                       // errors.Join
-	errInternal                   // from a call that can't reach the network; never reported
+	errUnknown      errKind = iota // can't tell; never reported
+	errGood                        // typed error, status, RespError, mapper output or nil
+	errConstructed                 // errors.New or fmt.Errorf without wrapping anything typed
+	errRaw                         // returned unchanged from a network or library call
+	errJoin                        // errors.Join
+	errInternal                    // from a call that can't reach the network; never reported
+	errUnrecognised                // a RespError form the media proxy doesn't recognise, named by msg
 )
 
 type errOrigin struct {
@@ -62,14 +63,14 @@ func (o errOrigin) calleeFuncName() string {
 }
 
 func (o errOrigin) bad() bool {
-	return o.kind == errConstructed || o.kind == errRaw || o.kind == errJoin
+	return o.kind == errConstructed || o.kind == errRaw || o.kind == errJoin || o.kind == errUnrecognised
 }
 
 // severity ranks bad origins for picking the one a function reports: a raw network error, then a plain
 // error wrapping one, then one that formats an error or status code into its text, then the rest.
 func (o errOrigin) severity() int {
 	switch {
-	case o.kind == errRaw:
+	case o.kind == errRaw, o.kind == errUnrecognised:
 		return 4
 	case o.kind == errConstructed && o.hasCallee():
 		return 3
@@ -96,8 +97,9 @@ type errFlow struct {
 
 	// Set for direct media, where what matters is whether the media proxy can tell a transport error
 	// from an upstream rejection.
-	transportMapped bool
-	libErrorTypes   bool
+	directMedia         bool
+	transportMapped     bool
+	bridgeRespErrMapped bool
 }
 
 func newErrFlow(pass *analysis.Pass, pi *pkgInfo, cfg *Config, mappers ...[]string) *errFlow {
@@ -112,11 +114,30 @@ func newErrFlow(pass *analysis.Pass, pi *pkgInfo, cfg *Config, mappers ...[]stri
 // forDirectMedia makes ef classify errors the way the media proxy sees them. Errors from an HTTP client
 // are transport errors, which it sends as 502 by itself (when the pinned mautrix does). Values of a
 // network library's own error types are library errors, since those carry the upstream status. An error
-// the function has already found not to be such a type is what the author chose to pass on.
+// the function has already found not to be such a type is what the author chose to pass on. RespErrors
+// the proxy doesn't recognise are reported like library errors.
 func (ef *errFlow) forDirectMedia() *errFlow {
-	ef.transportMapped = FrameworkHas(FeatureMediaProxyNetworkErrors)
-	ef.libErrorTypes = true
+	ef.directMedia = true
+	ef.transportMapped = !FrameworkLacks(FeatureMediaProxyNetworkErrors)
+	ef.bridgeRespErrMapped = !FrameworkLacks(FeatureBridgeRespErrorAs)
 	return ef
+}
+
+// unrecognisedRespError returns the origin of a RespError of type t that the media proxy sends as 404,
+// since errors.AsType[mautrix.RespError] doesn't match it: a pointer to a mautrix.RespError, or a
+// bridgev2.RespError before it had an As method.
+func (ef *errFlow) unrecognisedRespError(t types.Type, node ast.Node) (errOrigin, bool) {
+	if !ef.directMedia {
+		return errOrigin{}, false
+	}
+	_, isPtr := t.(*types.Pointer)
+	switch {
+	case isPtr && isNamed(t, pathMautrix, "RespError"):
+		return errOrigin{kind: errUnrecognised, node: node, msg: "a *mautrix.RespError"}, true
+	case isNamed(t, pathBridgev2, "RespError") && !ef.bridgeRespErrMapped:
+		return errOrigin{kind: errUnrecognised, node: node, msg: "a bridgev2.RespError", calleePkg: "bridgev2"}, true
+	}
+	return errOrigin{}, false
 }
 
 // errorResultIndex returns the index of the trailing error result, or -1.
@@ -378,6 +399,9 @@ func (ef *errFlow) classify(fn ast.Node, e ast.Expr, at token.Pos, depth int) er
 			if tn := ef.libErrorType(t); tn != nil {
 				return errOrigin{kind: errRaw, node: e, callee: tn, typed: true}
 			}
+			if o, ok := ef.unrecognisedRespError(t, e); ok {
+				return o
+			}
 			return errOrigin{kind: errGood}
 		}
 	}
@@ -393,10 +417,14 @@ func (ef *errFlow) classify(fn ast.Node, e ast.Expr, at token.Pos, depth int) er
 		if v.Parent() == v.Pkg().Scope() {
 			return ef.classifyPkgVar(v, x, depth)
 		}
-		if ef.libErrorTypes && ef.ruledOutLibType(fn, x, v) {
+		last, assigned := ef.lastAssignment(fn, v, at)
+		if ef.directMedia && ef.ruledOutLibType(fn, x, v, last.pos) {
 			return errOrigin{kind: errGood}
 		}
-		return ef.classifyLocal(fn, v, at, depth)
+		if !assigned {
+			return errOrigin{}
+		}
+		return ef.classifyAssignment(fn, last, depth)
 	case *ast.SelectorExpr:
 		if v, ok := ef.info.Uses[x.Sel].(*types.Var); ok && v.Pkg() != nil && v.Parent() == v.Pkg().Scope() {
 			return ef.classifyPkgVar(v, x, depth)
@@ -448,15 +476,20 @@ func (ef *errFlow) pkgVarInit(v *types.Var) ast.Expr {
 	return nil
 }
 
-// classifyLocal finds the last assignment to v before at.
-func (ef *errFlow) classifyLocal(fn ast.Node, v *types.Var, at token.Pos, depth int) errOrigin {
+type assignment struct {
+	pos    token.Pos
+	rhs    []ast.Expr
+	idx    int
+	lhsLen int
+}
+
+// lastAssignment finds the last assignment to v before at, by position.
+func (ef *errFlow) lastAssignment(fn ast.Node, v *types.Var, at token.Pos) (assignment, bool) {
 	body := funcBody(fn)
 	if body == nil {
-		return errOrigin{}
+		return assignment{}, false
 	}
-	var bestPos token.Pos
-	var bestRHS []ast.Expr
-	bestIdx, bestLHSLen := -1, 0
+	best := assignment{idx: -1}
 	consider := func(lhs []ast.Expr, rhs []ast.Expr, pos token.Pos) {
 		for i, l := range lhs {
 			id, ok := unparen(l).(*ast.Ident)
@@ -466,8 +499,8 @@ func (ef *errFlow) classifyLocal(fn ast.Node, v *types.Var, at token.Pos, depth 
 			if ef.info.Defs[id] != v && ef.info.Uses[id] != v {
 				continue
 			}
-			if pos < at && pos > bestPos {
-				bestPos, bestRHS, bestIdx, bestLHSLen = pos, rhs, i, len(lhs)
+			if pos < at && pos > best.pos {
+				best = assignment{pos: pos, rhs: rhs, idx: i, lhsLen: len(lhs)}
 			}
 		}
 	}
@@ -484,16 +517,18 @@ func (ef *errFlow) classifyLocal(fn ast.Node, v *types.Var, at token.Pos, depth 
 		}
 		return true
 	})
+	return best, best.idx >= 0
+}
+
+func (ef *errFlow) classifyAssignment(fn ast.Node, a assignment, depth int) errOrigin {
 	switch {
-	case bestIdx < 0:
-		return errOrigin{}
-	case len(bestRHS) == 0:
+	case len(a.rhs) == 0:
 		return errOrigin{kind: errGood}
-	case len(bestRHS) == bestLHSLen:
-		return ef.classify(fn, bestRHS[bestIdx], bestPos, depth)
-	case len(bestRHS) == 1:
-		if call, ok := unparen(bestRHS[0]).(*ast.CallExpr); ok {
-			return ef.classifyCall(fn, call, bestIdx, depth)
+	case len(a.rhs) == a.lhsLen:
+		return ef.classify(fn, a.rhs[a.idx], a.pos, depth)
+	case len(a.rhs) == 1:
+		if call, ok := unparen(a.rhs[0]).(*ast.CallExpr); ok {
+			return ef.classifyCall(fn, call, a.idx, depth)
 		}
 	}
 	return errOrigin{}
@@ -516,11 +551,14 @@ func (ef *errFlow) classifyCall(fn ast.Node, call *ast.CallExpr, idx, depth int)
 	if idx < 0 || idx >= sig.Results().Len() {
 		return errOrigin{}
 	}
-	if !isErrorInterface(sig.Results().At(idx).Type()) {
-		if isErrorType(sig.Results().At(idx).Type()) {
-			return errOrigin{kind: errGood}
+	if result := sig.Results().At(idx).Type(); !isErrorInterface(result) {
+		if !isErrorType(result) {
+			return errOrigin{}
 		}
-		return errOrigin{}
+		if o, ok := ef.unrecognisedRespError(result, call); ok {
+			return o
+		}
+		return errOrigin{kind: errGood}
 	}
 	switch {
 	case isPkgFunc(f, "errors", "New"):
@@ -789,6 +827,8 @@ func describeOrigin(fset *token.FileSet, o errOrigin) string {
 		}
 	case errJoin:
 		s = "errors.Join result"
+	case errUnrecognised:
+		s = o.msg
 	}
 	if o.helper != nil {
 		s += fmt.Sprintf(" (via %s at %s)", o.helper.Name.Name, shortPos(fset, o.node))

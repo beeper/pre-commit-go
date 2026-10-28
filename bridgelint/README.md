@@ -208,22 +208,24 @@ direct media `Download`, which is safe to retry.
 
 Direct media is served by bridgev2's media proxy, which calls the `Download` method of the
 `DirectMediableNetwork` implementation and turns its error into the response: a `mautrix.RespError` is
-sent as is (so is a `bridgev2.RespError` since mautrix v0.32.0, but not a pointer to either), an error passing
-`exhttp.IsNetworkError` is sent as 502, and anything else as 404 "Media not found". Clients treat a 404
-as the media being gone for good, so an upstream 401, 429 or 503 returned as a plain or library error
-breaks the media permanently.
+sent as is (so is a `bridgev2.RespError`, or a pointer to one, since mautrix v0.32.0, but never a
+pointer to a `mautrix.RespError`), an error passing `exhttp.IsNetworkError` is sent as 502, and anything
+else as 404 "Media not found". Clients treat a 404 as the media being gone for good, so an upstream 401,
+429 or 503 returned as a plain or library error breaks the media permanently.
 
 Errors from an HTTP client (`Do`, `Get`, `Head`, `Post` and `PostForm` on a `Client` in net/http or a
 fork like fhttp, and net/http's `Get` and friends) are all `*url.Error`s, which the proxy sends as 502,
 so they can be returned as is or wrapped with `%w`. Errors from any other function that reaches the
 network are reported: a library call's error can be a transport error or an upstream rejection, and
 nothing at the return tells them apart. An error the function has already found not to be the
-library's error type isn't reported, in the branch of an `errors.As`/`errors.AsType` check that didn't
-match or after one whose matching branch returns: what's left is what the author chose to pass on. In
-a network library of the module (a package that doesn't import bridgev2), a value of the library's own
-error type counts as a library error when the function returning it reaches the network, since that's
-how status errors are usually returned. When the pinned mautrix is older than v0.32.0, the proxy sends
-transport errors as 404 too, and they're reported as well.
+library's error type isn't reported: in the branch of an `errors.As`/`errors.AsType` check that didn't
+match, in a later case (or the `default`) of a tagless `switch` with the check as an earlier case, or
+after a check whose matching branch returns. What's left is what the author chose to pass on, unless the
+error was assigned again after the check, as when retrying after a refresh. In a network library of the
+module (a package that doesn't import bridgev2), a value of the library's own error type counts as a
+library error when the function returning it reaches the network, since that's how status errors are
+usually returned. When the pinned mautrix is older than v0.32.0, the proxy sends transport errors as 404
+too, and they're reported as well. When the pinned version is unknown, they aren't.
 
 The media proxy's own errors, like `mediaproxy.ErrInvalidMediaIDSyntax` for an ID that can't be parsed,
 aren't reported. Errors returned from a `GetMediaResponseFile` callback aren't checked: they're returned
@@ -247,7 +249,7 @@ as deliberate for LP002, and sets `com.beeper.can_retry` for clients.
 
 | Rule | Severity | Flags |
 |---|---|---|
-| DM001 | error | `Download` returns a network error unmapped: as is, or wrapped in `fmt.Errorf`, directly or through a same-package helper. Errors from an HTTP client aren't reported. |
+| DM001 | error | `Download` returns a network error unmapped: as is, or wrapped in `fmt.Errorf`, directly, through same-package helpers or through other packages of the module. Errors from an HTTP client aren't reported, and neither are errors already found not to be the library's type with `errors.As`/`errors.AsType`. Also a RespError the proxy doesn't recognise: a pointer to a `mautrix.RespError`, or a `bridgev2.RespError` on mautrix before v0.32.0. |
 | DM002 | warning | `Download` returns a plain error that formats an upstream status (`fmt.Errorf("unexpected status %d", resp.StatusCode)`), which is sent as 404 whatever the status was. The status is a `Status`, `StatusCode` or `Code` field of an HTTP response or of a network library's type, recognised by name as for LP004. |
 
 ### Error plumbing (EP)

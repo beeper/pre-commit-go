@@ -105,8 +105,107 @@ func (c *Connector) Download(ctx context.Context, mediaID string, params map[str
 			return nil, err
 		}
 		return &mediaproxy.GetMediaResponseData{Reader: resp.Body}, nil
+	case "reassigned":
+		_, err := c.client.Lookup(ctx, mediaID)
+		var apiErr *netlib.APIError
+		if errors.As(err, &apiErr) {
+			return nil, mautrix.MForbidden.WithMessage("Not allowed to download this media")
+		}
+		_, err = c.client.Lookup(ctx, mediaID+"?refreshed")
+		if err != nil {
+			return nil, err // want `DM001: Download returns raw error from netlib.Lookup`
+		}
+	case "reassigned-else":
+		_, err := c.client.Lookup(ctx, mediaID)
+		if apiErr, ok := errors.AsType[*netlib.APIError](err); !ok {
+			_, err = c.client.Lookup(ctx, mediaID+"?refreshed")
+			return nil, err // want `DM001: Download returns raw error from netlib.Lookup`
+		} else if apiErr.Code == http.StatusNotFound {
+			return nil, mautrix.MNotFound.WithMessage("Media was deleted")
+		}
+	case "switch":
+		_, err := c.client.Lookup(ctx, mediaID)
+		var apiErr *netlib.APIError
+		switch {
+		case err == nil:
+		case errors.As(err, &apiErr):
+			return nil, mautrix.MForbidden.WithMessage("Not allowed to download this media")
+		default:
+			return nil, err
+		}
+	case "switch-default-first":
+		_, err := c.client.Lookup(ctx, mediaID)
+		var apiErr *netlib.APIError
+		switch {
+		default:
+			return nil, err
+		case errors.As(err, &apiErr):
+			return nil, mautrix.MForbidden.WithMessage("Not allowed to download this media")
+		case err == nil:
+		}
+	case "switch-negated":
+		_, err := c.client.Lookup(ctx, mediaID)
+		var apiErr *netlib.APIError
+		switch {
+		case !errors.As(err, &apiErr):
+			return nil, err
+		case apiErr.Code == http.StatusNotFound:
+			return nil, mautrix.MNotFound.WithMessage("Media was deleted")
+		}
+	case "switch-after":
+		_, err := c.client.Lookup(ctx, mediaID)
+		switch apiErr, ok := errors.AsType[*netlib.APIError](err); {
+		case ok && apiErr.Code == http.StatusNotFound:
+			return nil, mautrix.MNotFound.WithMessage("Media was deleted")
+		case ok:
+			return nil, mautrix.MUnknown.WithMessage("Upstream returned %d", apiErr.Code).WithStatus(http.StatusBadGateway).WithCanRetry(true)
+		}
+		if err != nil {
+			return nil, err
+		}
+	case "switch-earlier-case":
+		_, err := c.client.Lookup(ctx, mediaID)
+		var apiErr *netlib.APIError
+		switch {
+		case err == nil:
+		case errors.Is(err, netlib.ErrUnauthorized):
+			return nil, err // want `DM001: Download returns raw error from netlib.Lookup`
+		case errors.As(err, &apiErr):
+			return nil, mautrix.MForbidden.WithMessage("Not allowed to download this media")
+		}
+	case "switch-fallthrough":
+		_, err := c.client.Lookup(ctx, mediaID)
+		var apiErr *netlib.APIError
+		switch {
+		case errors.As(err, &apiErr):
+			fallthrough
+		default:
+			return nil, err // want `DM001: Download returns raw error from netlib.Lookup`
+		}
+	case "switch-reassigned":
+		_, err := c.client.Lookup(ctx, mediaID)
+		var apiErr *netlib.APIError
+		switch {
+		case errors.As(err, &apiErr):
+			return nil, mautrix.MForbidden.WithMessage("Not allowed to download this media")
+		case err != nil:
+			_, err = c.client.Lookup(ctx, mediaID+"?refreshed")
+			return nil, err // want `DM001: Download returns raw error from netlib.Lookup`
+		}
+	case "pointer":
+		return nil, &mautrix.RespError{ErrCode: "M_NOT_FOUND", Err: "Media was deleted", StatusCode: http.StatusNotFound} // want `DM001: Download returns a \*mautrix.RespError, which the media proxy doesn't recognise as a RespError, so it sends it as 404; return a mautrix.RespError value`
+	case "pointer-helper":
+		return nil, gone() // want `DM001: Download returns a \*mautrix.RespError \(via gone at dm.go:\d+\), which the media proxy doesn't recognise`
+	case "bridgev2":
+		return nil, bridgev2.RespError(mautrix.MNotFound.WithMessage("Media was deleted"))
+	case "bridgev2-pointer":
+		return nil, &bridgev2.RespError{ErrCode: "M_NOT_FOUND", Err: "Media was deleted", StatusCode: http.StatusNotFound}
 	}
 	return nil, fmt.Errorf("unknown media ID")
+}
+
+func gone() error {
+	return &mautrix.RespError{ErrCode: "M_NOT_FOUND", Err: "Media was deleted", StatusCode: http.StatusNotFound}
 }
 
 func (c *Connector) fetch(ctx context.Context, mediaID string) (mediaproxy.GetMediaResponse, error) {

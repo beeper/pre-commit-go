@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"slices"
 
 	"golang.org/x/tools/go/analysis"
 )
@@ -43,6 +44,12 @@ func runDM(pass *analysis.Pass) (any, error) {
 			switch {
 			case o.kind == errRaw || o.kind == errConstructed && o.hasCallee():
 				report(pass, ret, DM001, fmt.Sprintf("Download returns %s, and %s; map upstream failures to a mautrix.RespError with a matching status", describeOrigin(pass.Fset, o), proxied))
+			case o.kind == errUnrecognised:
+				proxy := "the media proxy"
+				if o.calleePkgName() == "bridgev2" {
+					proxy = "the pinned mautrix (before v0.32.0)"
+				}
+				report(pass, ret, DM001, fmt.Sprintf("Download returns %s, which %s doesn't recognise as a RespError, so it sends it as 404; return a mautrix.RespError value", describeOrigin(pass.Fset, o), proxy))
 			case o.kind == errConstructed && o.formatsStatus:
 				report(pass, ret, DM002, fmt.Sprintf("Download returns %s built from an upstream status, which the media proxy sends as 404 whatever the status was; return a mautrix.RespError with a matching status", describeOrigin(pass.Fset, o)))
 			}
@@ -84,7 +91,7 @@ func isHTTPPackage(pkg *types.Package) bool {
 // libErrorType returns the type of t when it's a network library's own error type, like a typed HTTP
 // status error: one declared in a network library that isn't a bridge package or the standard library.
 func (ef *errFlow) libErrorType(t types.Type) *types.TypeName {
-	if !ef.libErrorTypes || !isErrorType(t) || isRespErrorType(t) {
+	if !ef.directMedia || !isErrorType(t) || isRespErrorType(t) {
 		return nil
 	}
 	if ptr, ok := t.(*types.Pointer); ok {
@@ -113,28 +120,101 @@ func (ef *errFlow) isBridgePkg(pkg *types.Package) bool {
 	return false
 }
 
-// ruledOutLibType reports whether use, a use of the error v, is where the function already knows v isn't
-// the library error type it checked for: in the branch of the check that didn't match, or after one
-// whose matching branch returns.
-func (ef *errFlow) ruledOutLibType(fn ast.Node, use ast.Node, v types.Object) bool {
+// typeCheck matches a condition, with the init statement of its if or switch, that checks the error
+// being classified for a library error type. ok is unset for a check made before the error was last
+// assigned, which says nothing about the value used.
+type typeCheck func(cond ast.Expr, init ast.Stmt) (negated, ok bool)
+
+// ruledOutLibType reports whether use, a use of the error v last assigned at assigned, is where the
+// function already knows v isn't the library error type it checked for: in the branch or switch case
+// that only runs when the check didn't match, or after a check whose matching branch returns.
+func (ef *errFlow) ruledOutLibType(fn ast.Node, use ast.Node, v types.Object, assigned token.Pos) bool {
+	check := func(cond ast.Expr, init ast.Stmt) (negated, ok bool) {
+		call, negated := ef.libTypeCheck(cond, init, v)
+		return negated, call != nil && call.Pos() > assigned
+	}
 	var prev ast.Node = use
 	for p := ef.pi.parents[use]; p != nil && p != fn; prev, p = p, ef.pi.parents[p] {
 		switch s := p.(type) {
 		case *ast.IfStmt:
-			if negated, ok := ef.libTypeCheck(s, v); ok && (prev == s.Body && negated || prev == s.Else && !negated) {
+			if negated, ok := check(s.Cond, s.Init); ok && (prev == s.Body && negated || prev == s.Else && !negated) {
 				return true
 			}
-		default:
-			for _, st := range stmtList(p) {
-				if st == prev {
-					break
-				}
-				if ifs, ok := st.(*ast.IfStmt); ok {
-					if negated, ok := ef.libTypeCheck(ifs, v); ok && !negated && endsInReturn(ifs.Body) {
-						return true
-					}
-				}
+		case *ast.CaseClause:
+			if ef.caseRulesOut(s, prev, check) {
+				return true
 			}
+		}
+		for _, st := range stmtList(p) {
+			if st == prev {
+				break
+			}
+			if returnsWhenMatched(st, check) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// caseRulesOut reports whether prev, a statement in cc, only runs when the check didn't match: cc is a
+// case of a tagless switch that is a negated check, or an earlier case (any other, for default) is a
+// check and doesn't fall through. Cases don't fall through otherwise, so reaching cc means it was false.
+func (ef *errFlow) caseRulesOut(cc *ast.CaseClause, prev ast.Node, check typeCheck) bool {
+	st, isStmt := prev.(ast.Stmt)
+	body, _ := ef.pi.parents[cc].(*ast.BlockStmt)
+	if !isStmt || body == nil || !slices.Contains(cc.Body, st) {
+		return false
+	}
+	sw, _ := ef.pi.parents[body].(*ast.SwitchStmt)
+	if sw == nil || sw.Tag != nil {
+		return false
+	}
+	if len(cc.List) == 1 {
+		if negated, ok := check(cc.List[0], sw.Init); ok && negated {
+			return true
+		}
+	}
+	for _, c := range sw.Body.List {
+		other := c.(*ast.CaseClause)
+		if other == cc {
+			if cc.List != nil {
+				break
+			}
+			continue
+		}
+		if !endsInFallthrough(other.Body) && matchesCase(other, sw.Init, check) {
+			return true
+		}
+	}
+	return false
+}
+
+// returnsWhenMatched reports whether st is an if or a tagless switch with a check whose matching branch
+// returns, so the error isn't the library type after it.
+func returnsWhenMatched(st ast.Stmt, check typeCheck) bool {
+	switch s := st.(type) {
+	case *ast.IfStmt:
+		negated, ok := check(s.Cond, s.Init)
+		return ok && !negated && endsInReturn(s.Body.List)
+	case *ast.SwitchStmt:
+		if s.Tag != nil {
+			return false
+		}
+		for _, c := range s.Body.List {
+			if cc := c.(*ast.CaseClause); matchesCase(cc, s.Init, check) && endsInReturn(cc.Body) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// matchesCase reports whether one of cc's expressions is a check that isn't negated.
+func matchesCase(cc *ast.CaseClause, init ast.Stmt, check typeCheck) bool {
+	for _, e := range cc.List {
+		if negated, ok := check(e, init); ok && !negated {
+			return true
 		}
 	}
 	return false
@@ -152,32 +232,32 @@ func stmtList(n ast.Node) []ast.Stmt {
 	return nil
 }
 
-// libTypeCheck matches an if whose whole condition checks v for a library error type, possibly negated:
-// errors.As(v, &target), or the ok of `target, ok := errors.AsType[T](v)` in its init.
-func (ef *errFlow) libTypeCheck(ifs *ast.IfStmt, v types.Object) (negated, ok bool) {
-	cond := unparen(ifs.Cond)
+// libTypeCheck matches a condition that checks v for a library error type, possibly negated:
+// errors.As(v, &target), or the ok of `target, ok := errors.AsType[T](v)` in init. It returns the
+// errors.As or errors.AsType call, or nil.
+func (ef *errFlow) libTypeCheck(cond ast.Expr, init ast.Stmt, v types.Object) (call *ast.CallExpr, negated bool) {
+	cond = unparen(cond)
 	if u, isNot := cond.(*ast.UnaryExpr); isNot && u.Op == token.NOT {
 		negated, cond = true, unparen(u.X)
 	}
-	var call *ast.CallExpr
 	switch c := cond.(type) {
 	case *ast.CallExpr:
 		call = c
 	case *ast.Ident:
-		as, isAssign := ifs.Init.(*ast.AssignStmt)
+		as, isAssign := init.(*ast.AssignStmt)
 		if !isAssign || len(as.Lhs) != 2 || len(as.Rhs) != 1 {
-			return false, false
+			return nil, false
 		}
 		if id, isIdent := as.Lhs[1].(*ast.Ident); !isIdent || ef.info.ObjectOf(id) != ef.info.ObjectOf(c) {
-			return false, false
+			return nil, false
 		}
 		call, _ = unparen(as.Rhs[0]).(*ast.CallExpr)
 	}
 	if call == nil || len(call.Args) == 0 {
-		return false, false
+		return nil, false
 	}
 	if id, isIdent := unparen(call.Args[0]).(*ast.Ident); !isIdent || ef.info.Uses[id] != v {
-		return false, false
+		return nil, false
 	}
 	var target types.Type
 	switch obj := calleeObj(ef.info, call); {
@@ -190,13 +270,24 @@ func (ef *errFlow) libTypeCheck(ifs *ast.IfStmt, v types.Object) (negated, ok bo
 			target = ef.info.TypeOf(ie.Index)
 		}
 	}
-	return negated, target != nil && ef.libErrorType(target) != nil
+	if target == nil || ef.libErrorType(target) == nil {
+		return nil, false
+	}
+	return call, negated
 }
 
-func endsInReturn(b *ast.BlockStmt) bool {
-	if len(b.List) == 0 {
+func endsInReturn(list []ast.Stmt) bool {
+	if len(list) == 0 {
 		return false
 	}
-	_, ok := b.List[len(b.List)-1].(*ast.ReturnStmt)
+	_, ok := list[len(list)-1].(*ast.ReturnStmt)
 	return ok
+}
+
+func endsInFallthrough(list []ast.Stmt) bool {
+	if len(list) == 0 {
+		return false
+	}
+	b, ok := list[len(list)-1].(*ast.BranchStmt)
+	return ok && b.Tok == token.FALLTHROUGH
 }

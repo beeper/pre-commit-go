@@ -38,6 +38,20 @@ func TestFrameworkHas(t *testing.T) {
 			t.Errorf("FrameworkHas(relogin) with %q = %v, want %v", v, got, want)
 		}
 	}
+	lacks := map[string]bool{
+		"":                           false,
+		"devel":                      false,
+		"local":                      false,
+		"v0.31.0":                    true,
+		"v0.32.0":                    false,
+		"local@2026-10-12T00:00:00Z": true,
+	}
+	for v, want := range lacks {
+		MautrixVersion = v
+		if got := FrameworkLacks(FeatureMediaProxyNetworkErrors); got != want {
+			t.Errorf("FrameworkLacks(media proxy) with %q = %v, want %v", v, got, want)
+		}
+	}
 	MautrixVersion = ""
 }
 
@@ -97,6 +111,8 @@ func TestDM(t *testing.T) {
 	MautrixVersion = "local"
 	analysistest.Run(t, analysistest.TestData(), DMAnalyzer, "dm")
 	analysistest.Run(t, filepath.Join(analysistest.TestData(), "dmmod"), DMAnalyzer, "./...")
+	MautrixVersion = ""
+	analysistest.Run(t, analysistest.TestData(), DMAnalyzer, "dm")
 	MautrixVersion = "v0.31.0"
 	analysistest.Run(t, analysistest.TestData(), DMAnalyzer, "dmold")
 }
