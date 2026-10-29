@@ -118,11 +118,15 @@ func TestDM(t *testing.T) {
 }
 
 func TestEP(t *testing.T) {
-	analysistest.Run(t, analysistest.TestData(), EPAnalyzer, "ep", "epnetlib", "epmain")
+	analysistest.Run(t, analysistest.TestData(), EPAnalyzer, "ep", "epnetlib", "epmain", "epdecode")
 }
 
 func TestGR(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), GRAnalyzer, "gr")
+}
+
+func TestMC(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), MCAnalyzer, "mc", "mcgif", "mcrej")
 }
 
 func TestBL(t *testing.T) {

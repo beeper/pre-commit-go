@@ -73,6 +73,7 @@ var (
 	EP001 = rule("EP001", SeverityError, "matching errors by string")
 	EP002 = rule("EP002", SeverityWarning, "library error without a typed status")
 	EP003 = rule("EP003", SeverityInfo, "errors.Join in a user-facing path")
+	EP004 = rule("EP004", SeverityWarning, "decode error dropped without a trace")
 
 	GR001 = rule("GR001", SeverityWarning, "response body not closed")
 	GR002 = rule("GR002", SeverityWarning, "HTTP request without context or timeout")
@@ -83,6 +84,10 @@ var (
 	GR009 = rule("GR009", SeverityWarning, "package-level map or slice written at runtime, shared across logins")
 	GR011 = rule("GR011", SeverityWarning, "RoomFeatures.ID is constant while capabilities vary")
 	GR013 = rule("GR013", SeverityWarning, "LogoutRemote doesn't stop the client")
+
+	MC001 = rule("MC001", SeverityError, "pre-uploaded avatar without a hash")
+	MC002 = rule("MC002", SeverityWarning, "GIFs accepted but fi.mau.gif not declared")
+	MC003 = rule("MC003", SeverityWarning, "image, video or audio content without info")
 )
 
 // Category is "<rule>:<severity>" so drivers can recover both from a Diagnostic.
