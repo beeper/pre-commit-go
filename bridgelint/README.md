@@ -259,6 +259,7 @@ as deliberate for LP002, and sets `com.beeper.can_retry` for clients.
 | EP001 | error | Errors matched by exact string: `err.Error() == "..."`, `switch err.Error()`, `strings.EqualFold(err.Error(), ...)`. Comparisons with `""` and substring matches aren't flagged, since some servers only give text. |
 | EP002 | warning | In library packages (ones that don't import bridgev2, other than `main`), an `http.Response` status formatted into a plain error, so callers can't tell 429 from 403 from 5xx. Forks like fhttp count when their `Response` has net/http's fields. |
 | EP003 | info | `errors.Join` returned from a Matrix handler or used as a user-facing message. |
+| EP004 | warning | In a function with no results, `if json.Unmarshal(...) != nil { return }`, the same with `err := ...; err != nil`, or a `json.Decoder.Decode`/`proto.Unmarshal` check, where the branch is only a bare `return`. A payload of an unexpected shape then disappears with no log. `continue` isn't flagged, since loops often skip entries of other shapes on purpose. |
 
 ### General reliability (GR)
 
@@ -273,6 +274,16 @@ as deliberate for LP002, and sets `com.beeper.can_retry` for clients.
 | GR009 | warning | A package-level map or slice written at runtime in a bridge package, shared by every login. |
 | GR011 | warning | `GetCapabilities` changes `RoomFeatures` fields but never the `ID`, so clients cache the wrong features. |
 | GR013 | warning | `LogoutRemote` that never disconnects or stops the client, when the pinned mautrix doesn't disconnect after `LogoutRemote` itself (v0.32.0 and earlier). The stopping call is recognised by name, a name heuristic. |
+
+### Matrix content (MC)
+
+What clients need from bridged events and room features to render them correctly.
+
+| Rule | Severity | Flags |
+|---|---|---|
+| MC001 | error | A `bridgev2.Avatar` built in the function with a non-constant `MXC` and no `Hash`, either as a literal or by assigning `MXC` to an avatar literal that has no hash. bridgev2 skips the update when the new hash equals the stored one and an MXC is already set, so every avatar change after the first is lost. Avatars passed in or returned by helpers aren't checked. |
+| MC002 | warning | Image capabilities that accept `image/gif` (a `FileFeatureMap` literal's `m.image` entry, following `MimeTypes` to a package-level map) when nothing in the package uses `event.CapMsgGIF`. Clients only enable their GIF picker with `fi.mau.gif`. |
+| MC003 | warning | Image, video or audio `MessageEventContent` built in the function, with a URL or file, that gets no `Info` on any path to the end of the function. Content handed to another function is assumed to get its info there. Clients use `info.mimetype` to pick a renderer and to name cached files. |
 
 ### Deliberately not included
 

@@ -130,3 +130,11 @@ type LoginInputDataField struct {
 type Bridge struct{}
 
 func (br *Bridge) QueueRemoteEvent(login *UserLogin, evt any) {}
+
+type Avatar struct {
+	ID     string
+	Get    func() ([]byte, error)
+	Remove bool
+	MXC    string
+	Hash   [32]byte
+}
