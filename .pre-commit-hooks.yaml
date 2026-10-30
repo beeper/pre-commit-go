@@ -22,3 +22,9 @@
   entry: banglobalzerolog
   language: golang
   types_or: [ go ]
+- id: json-use-omitzero
+  name: json-use-omitzero
+  description: Use omitzero instead of omitempty for numeric and boolean fields in JSON struct tags
+  entry: useomitzero
+  language: golang
+  types_or: [ go ]
