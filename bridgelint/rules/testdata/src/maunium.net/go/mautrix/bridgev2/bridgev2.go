@@ -73,6 +73,7 @@ type MatrixViewLimitedMedia struct{ Content string }
 type MatrixMessageResponse struct{}
 type MatrixEdit struct{}
 type MatrixReaction struct{}
+type MatrixMessageRemove struct{}
 type ResolveIdentifierResponse struct{}
 type LoginStep struct{}
 type LoginFlow struct{}

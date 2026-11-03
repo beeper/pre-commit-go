@@ -47,6 +47,9 @@ importers through the build cache. Packages that haven't changed aren't analysed
 - `warning` findings are reported but don't fail it.
 - `info` findings only show with `-verbose`.
 
+The exit code is 1 when there are error findings, and 2 when the linter itself or `go vet` fails (a
+package that doesn't build, for example).
+
 Severities can be changed per rule in the config, so a new rule can start as a warning while a bridge
 burns down existing hits.
 
@@ -111,8 +114,8 @@ An error counts as a raw network error when it comes from a function that can re
 bridgelint follows calls from source through every package the bridge depends on, except the standard
 library, bridgev2 and `go.mau.fi/util`, down to these standard library calls:
 
-- an HTTP round trip: `Do`/`RoundTrip` taking a `*Request` on any client (net/http or a fork like fhttp,
-  whose transports send from goroutines), and `http.Get` and friends;
+- an HTTP round trip: `Do`/`RoundTrip` taking a `*Request` with net/http's fields on any client (net/http
+  or a fork like fhttp, whose transports send from goroutines), and `http.Get` and friends;
 - a dial in `net` or `crypto/tls`;
 - a read or write on a `net` or `crypto/tls` connection.
 
@@ -129,7 +132,9 @@ when it takes a `context.Context`, belongs to a network library or the module be
 one of these calls: a context-taking call through a func value or through an interface with no visible
 implementation, or a read or write on a `bufio.Reader`/`Writer` kept in a struct field. A call through
 one of the function's own parameters doesn't count, since what's passed in is followed where it's
-passed: a transaction helper `withTx(ctx, fn)` is as visible as the literals given to it. A network
+passed: a transaction helper `withTx(ctx, fn)` is as visible as the literals given to it. Neither does a
+call through an interface declared in a bridge package (one that imports bridgev2): those are the
+bridge's own seams, like a message store wired up in `main`, not a library's transport. A network
 library is a package that has functions reaching the network, or imports one. A context-taking helper
 that doesn't do any of this (an audio converter, a database layer) never counts.
 
@@ -138,8 +143,11 @@ instead, so the statuses they return count as mapped. So are functions in the mo
 can be classified: a converter that logs a failed upload and returns a fixed `ErrUploadFailed` doesn't
 return a network error, even though it reaches the network. One with returns that can't be classified
 (a naked return, an error read from a field) still counts as returning whatever the network gives it.
-Package-level error values count as network errors when their package is a network library. Set `network_packages` to make every function in a package
-count as reaching the network.
+Package-level error values count as network errors when their package is a network library.
+
+Set `network_packages` to make every function in a package count as reaching the network. A module
+whose path has no dot (`module bridge`) is treated like the standard library and isn't followed, so it
+gets fewer findings.
 
 Plain `errors.New`/`fmt.Errorf` errors that don't wrap a network error are treated as internal
 invariants (bad portal IDs, impossible states) and aren't reported, except when `CreateLogin` returns
@@ -158,6 +166,8 @@ Rules that depend on newer bridgev2 behaviour check the module's `maunium.net/go
 
 Matrix handlers are the `HandleMatrix*`/`PreHandleMatrix*` methods of a `NetworkAPI` implementation.
 Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` with no message.
+`HandleMatrixReadReceipt`, `HandleMatrixTyping` and `HandleMatrixViewingChat` are skipped, since bridgev2
+only logs their errors.
 
 | Rule | Severity | Flags |
 |---|---|---|
@@ -176,8 +186,8 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 |---|---|---|
 | BS001 | info | An explicit `UserActionRelogin` on `BAD_CREDENTIALS`, when the pinned mautrix already defaults to it (after v0.32.0). |
 | BS002 | warning | A restriction code that isn't `BAD_CREDENTIALS` with `RESTART` (the user fixes it in the app or at a URL, then the bridge is restarted) or `OPEN_NATIVE` (the bridge recovers by itself once the user fixes it in the app). Which of the two is right depends on the bridge, so there's no autofix. A restriction code contains one of these whole words (the code is split on anything that isn't a letter or digit): ban(ned), suspend(ed), suspension, restrict(ed), restriction, lock(ed), lockout, checkpoint, consent, challenge, disabled, deactivate(d), or the pairs access-denied, not-offered. It's a warning because it matches words in the code. |
-| BS003 | error | `Message` built from `err.Error()` or `fmt.Sprintf(..., err)`. Warning when the code has a `BridgeStateHumanErrors` entry, since the text is then silently discarded. |
-| BS004 | error | An error state with no `Error` code, a code that doesn't match `<error_prefix>-<reason>`, or a code built with `fmt.Sprintf`. |
+| BS003 | error | `Message` built from `err.Error()` or `fmt.Sprintf(..., err)`. `Error()` on the bridge's own error types (declared in the package, or in a package of the module that isn't a network library) doesn't count. Warning when the code has a `BridgeStateHumanErrors` entry, since the text is then silently discarded. |
+| BS004 | error | An error state with no `Error` code, a code that doesn't match `<error_prefix>-<reason>`, or a code built with `fmt.Sprintf`. Fields set later in the same function count, and a state whose address is passed to other code isn't reported as missing a code. |
 | BS005 | warning | A code with no `Message` and no `BridgeStateHumanErrors` entry in the package or the packages it imports. |
 | BS009 | warning | An event-handler type switch for a configured library with no case for its disconnect events. The switch is recognised by its case types being named like events, a name heuristic. |
 | BS010 | warning | `TRANSIENT_DISCONNECT` reached only after a check for a rejected session: a comparison against 401 or 403 (`http.StatusUnauthorized` and friends included, since they're constants), or `errors.Is`/`errors.As` against one of the `auth_errors`. A negated check (`!= 401`, `!errors.Is`) guards its `else` branch. |
@@ -186,8 +196,8 @@ Their errors become message statuses, and a bare error becomes `FAIL_RETRIABLE` 
 ### Login and provisioning (LP)
 
 Login methods are the methods of `LoginProcess*` implementations plus `NetworkConnector.CreateLogin`.
-Provisioning methods are `ResolveIdentifier`, `CreateGroup`, `CreateChatWithGhost`, `SearchUsers` and
-`GetContactList`. A plain error from these becomes a bare 500 `M_UNKNOWN`.
+Provisioning methods are `ResolveIdentifier`, `CreateGroup`, `CreateChatWithGhost`, `SearchUsers`,
+`GetContactList` and `HandleMatrixViewLimitedMedia`. A plain error from these becomes a bare 500 `M_UNKNOWN`.
 
 Clients retry 429 and 502-504 automatically, and login and provisioning requests must not be retried
 behind the user's back, so `RespError`s never use those statuses. Rate limits are `M_LIMIT_EXCEEDED` with
@@ -244,19 +254,20 @@ means the client's own access token was rejected.
 | a transport error from an HTTP client | the error, as is or wrapped with `%w` |
 
 A media fetch is safe to retry, so the statuses clients retry automatically are the right ones here
-and LP002 doesn't apply inside `Download`. In a helper outside it, `WithCanRetry(true)` marks the retry
-as deliberate for LP002, and sets `com.beeper.can_retry` for clients.
+and LP002 doesn't apply inside `Download`, or to a package-level variable only direct media code uses.
+In a helper outside it, `WithCanRetry(true)` marks the retry as deliberate for LP002, and sets
+`com.beeper.can_retry` for clients.
 
 | Rule | Severity | Flags |
 |---|---|---|
-| DM001 | error | `Download` returns a network error unmapped: as is, or wrapped in `fmt.Errorf`, directly, through same-package helpers or through other packages of the module. Errors from an HTTP client aren't reported, and neither are errors already found not to be the library's type with `errors.As`/`errors.AsType`. Also a RespError the proxy doesn't recognise: a pointer to a `mautrix.RespError`, or a `bridgev2.RespError` on mautrix before v0.32.0. |
+| DM001 | error | `Download` returns a network error unmapped: as is, or wrapped in `fmt.Errorf`, directly, through same-package helpers or through other packages of the module. Errors from an HTTP client aren't reported, and neither are errors already found not to be the library's type: after an `errors.As`/`errors.AsType` check, a type assertion or a type switch whose matching branch can't fall through (it returns, panics, or ends in an `if`/`switch` whose every branch does), or in the branch where the check failed. Also a RespError the proxy doesn't recognise: a pointer to a `mautrix.RespError`, or a `bridgev2.RespError` on mautrix before v0.32.0. |
 | DM002 | warning | `Download` returns a plain error that formats an upstream status (`fmt.Errorf("unexpected status %d", resp.StatusCode)`), which is sent as 404 whatever the status was. The status is a `Status`, `StatusCode` or `Code` field of an HTTP response or of a network library's type, recognised by name as for LP004. |
 
 ### Error plumbing (EP)
 
 | Rule | Severity | Flags |
 |---|---|---|
-| EP001 | error | Errors matched by exact string: `err.Error() == "..."`, `switch err.Error()`, `strings.EqualFold(err.Error(), ...)`. Comparisons with `""` and substring matches aren't flagged, since some servers only give text. |
+| EP001 | error | Errors matched by exact string: `err.Error() == "..."`, `switch err.Error()` with a constant case, `strings.EqualFold(err.Error(), "...")`. Only comparisons with a non-empty constant string are flagged: comparing two errors' text (log de-duplication) and substring matches aren't, since some servers only give text. |
 | EP002 | warning | In library packages (ones that don't import bridgev2, other than `main`), an `http.Response` status formatted into a plain error, so callers can't tell 429 from 403 from 5xx. Forks like fhttp count when their `Response` has net/http's fields. |
 | EP003 | info | `errors.Join` returned from a Matrix handler or used as a user-facing message. |
 | EP004 | warning | In a function with no results, `if json.Unmarshal(...) != nil { return }`, the same with `err := ...; err != nil`, or a `json.Decoder.Decode`/`proto.Unmarshal` check, where the branch is only a bare `return`. A payload of an unexpected shape then disappears with no log. `continue` isn't flagged, since loops often skip entries of other shapes on purpose. |
@@ -266,13 +277,13 @@ as deliberate for LP002, and sets `com.beeper.can_retry` for clients.
 | Rule | Severity | Flags |
 |---|---|---|
 | GR001 | warning | An `*http.Response` whose body is never closed and isn't passed on. |
-| GR002 | warning | `http.Get`/`Post`/`Head`, or `http.NewRequest` without a context. |
+| GR002 | warning | `http.Get`/`Post`/`Head`/`PostForm`, or `http.NewRequest` without a context. |
 | GR003 | warning | A request built once with a body and re-sent with `Do` inside a loop; the body is empty on retries. |
 | GR004 | error | `os.Exit`, `log.Fatal*` or zerolog `Fatal()` outside `main`, `init` and `Must*` functions. Panics, including `log.Panic*` and zerolog `Panic()`, aren't flagged: they're alerted on and fixed at the source. |
 | GR007 | warning | A blocking channel send in a Matrix handler: no `select` with a `default` or a receive case like `ctx.Done()`, a timer or a stop channel. |
 | GR008 | warning | A cursor/seq/checkpoint field assigned after a loop that calls `QueueRemoteEvent`, before the events are handled. The field is recognised by name, a name heuristic. |
-| GR009 | warning | A package-level map or slice written at runtime in a bridge package, shared by every login. |
-| GR011 | warning | `GetCapabilities` changes `RoomFeatures` fields but never the `ID`, so clients cache the wrong features. |
+| GR009 | warning | A package-level map or slice written at runtime in a bridge package, shared by every login. Writes in `init` and in functions run by `sync.Once.Do`, `sync.OnceFunc`, `sync.OnceValue` or `sync.OnceValues` are lazy initialisation and aren't flagged. |
+| GR011 | warning | `GetCapabilities` changes `RoomFeatures` fields under a condition (an `if`, `switch`, `select` or loop) but never the `ID`, so clients cache the wrong features. A change made on every call gives every result the same features, so it isn't flagged. |
 | GR013 | warning | `LogoutRemote` that never disconnects or stops the client, when the pinned mautrix doesn't disconnect after `LogoutRemote` itself (v0.32.0 and earlier). The stopping call is recognised by name, a name heuristic. |
 
 ### Matrix content (MC)

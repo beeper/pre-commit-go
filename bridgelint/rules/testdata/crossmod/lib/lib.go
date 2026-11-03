@@ -47,3 +47,8 @@ func ConvertAudio(ctx context.Context, data []byte) ([]byte, error) {
 	}
 	return data, nil
 }
+
+// Error carries the remote's own text.
+type Error struct{ Msg string }
+
+func (e *Error) Error() string { return e.Msg }

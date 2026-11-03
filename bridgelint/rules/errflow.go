@@ -648,10 +648,8 @@ func isHTTPRoundTrip(f *types.Func) bool {
 		return false
 	}
 	for i := 0; i < sig.Params().Len(); i++ {
-		if ptr, ok := sig.Params().At(i).Type().(*types.Pointer); ok {
-			if named, ok := ptr.Elem().(*types.Named); ok && named.Obj().Name() == "Request" {
-				return true
-			}
+		if ptr, ok := sig.Params().At(i).Type().(*types.Pointer); ok && isHTTPStruct(ptr.Elem(), "Request") {
+			return true
 		}
 	}
 	return false

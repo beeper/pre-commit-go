@@ -414,7 +414,7 @@ func (r *netReach) mightReach(f *types.Func, inModule bool) bool {
 // visible from this package resolved.
 func (r *netReach) isHidden(f *types.Func) bool {
 	if ref, ok := r.ifaceRefOf(f); ok {
-		return !r.implemented(ref)
+		return !r.bridgeIface(ref) && !r.implemented(ref)
 	}
 	if f.Pkg() == r.pass.Pkg {
 		if r.hidden[f] {
@@ -448,7 +448,23 @@ func (r *netReach) isHidden(f *types.Func) bool {
 // hiddenRef reports whether ref is a context-taking interface call that can't be followed: nothing
 // visible from this package implements the interface.
 func (r *netReach) hiddenRef(ref ifaceRef) bool {
-	return ref.Ctx && !r.resolve(ref) && !r.implemented(ref)
+	return ref.Ctx && !r.bridgeIface(ref) && !r.resolve(ref) && !r.implemented(ref)
+}
+
+// bridgeIface reports whether ref's interface is declared in a bridge package, one that imports bridgev2.
+// A bridge's own interfaces are seams like stores and mocks wired up elsewhere, not a network library's
+// transport, so an implementation that can't be seen doesn't make the call a network one.
+func (r *netReach) bridgeIface(ref ifaceRef) bool {
+	pkg := r.pkgs[ref.Pkg]
+	if pkg == nil {
+		return false
+	}
+	for _, imp := range pkg.Imports() {
+		if imp.Path() == pathBridgev2 {
+			return true
+		}
+	}
+	return false
 }
 
 // implemented reports whether any named type visible from this package implements ref's interface.

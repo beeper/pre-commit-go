@@ -106,6 +106,7 @@ func statuses(err error) []error {
 	return []error{
 		bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusUnsupported), // want `MSS002: status has ErrorReason MessageStatusUnsupported but no WithStatus`
 		bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusUnsupported).WithStatus(event.MessageStatusFail).WithIsCertain(true),
+		bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusTooOld).WithIsCertain(true),
 		bridgev2.WrapErrorInStatus(errors.New("stickers are not supported")),
 		bridgev2.WrapErrorInStatus(err).WithErrorAsMessage().WithStatus(event.MessageStatusFail).WithErrorReason(event.MessageStatusUnsupported),
 		bridgev2.WrapErrorInStatus(fmt.Errorf("server said %w", err)).WithErrorAsMessage().WithErrorReason(event.MessageStatusNetworkError), // want `MSS003: WithErrorAsMessage shows an error that formats another error`
@@ -125,6 +126,21 @@ func suppressed(err error) error {
 func bareIgnore(err error) error {
 	//bridgelint:ignore because I said so
 	return bridgev2.WrapErrorInStatus(err).WithErrorReason(event.MessageStatusUnsupported) // want `MSS002`
+}
+
+func (c *Client) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) error {
+	_, err := c.client.Send(ctx, "react")
+	switch {
+	case errors.Is(err, context.Canceled):
+		return err
+	case err != nil:
+		return err // want `MSS001: HandleMatrixReaction returns raw error from netlib.Send` `MSS006: this package has codeOf`
+	}
+	_, err = c.client.Send(ctx, "react")
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	return mapped(err)
 }
 
 func (c *Client) HandleMatrixReadReceipt(ctx context.Context, msg *bridgev2.MatrixMessage) error {

@@ -130,8 +130,11 @@ type typeCheck func(cond ast.Expr, init ast.Stmt) (negated, ok bool)
 // that only runs when the check didn't match, or after a check whose matching branch returns.
 func (ef *errFlow) ruledOutLibType(fn ast.Node, use ast.Node, v types.Object, assigned token.Pos) bool {
 	check := func(cond ast.Expr, init ast.Stmt) (negated, ok bool) {
-		call, negated := ef.libTypeCheck(cond, init, v)
-		return negated, call != nil && call.Pos() > assigned
+		found, negated := ef.libTypeCheck(cond, init, v)
+		return negated, found != nil && found.Pos() > assigned
+	}
+	caseCheck := func(sw *ast.TypeSwitchStmt, cc *ast.CaseClause) bool {
+		return sw.Pos() > assigned && ef.typeSwitchOn(sw, v) && ef.listsLibType(cc)
 	}
 	var prev ast.Node = use
 	for p := ef.pi.parents[use]; p != nil && p != fn; prev, p = p, ef.pi.parents[p] {
@@ -141,7 +144,7 @@ func (ef *errFlow) ruledOutLibType(fn ast.Node, use ast.Node, v types.Object, as
 				return true
 			}
 		case *ast.CaseClause:
-			if ef.caseRulesOut(s, prev, check) {
+			if ef.caseRulesOut(s, prev, check) || ef.typeCaseRulesOut(s, prev, caseCheck) {
 				return true
 			}
 		}
@@ -149,7 +152,7 @@ func (ef *errFlow) ruledOutLibType(fn ast.Node, use ast.Node, v types.Object, as
 			if st == prev {
 				break
 			}
-			if returnsWhenMatched(st, check) {
+			if returnsWhenMatched(st, check, caseCheck) {
 				return true
 			}
 		}
@@ -190,19 +193,84 @@ func (ef *errFlow) caseRulesOut(cc *ast.CaseClause, prev ast.Node, check typeChe
 	return false
 }
 
-// returnsWhenMatched reports whether st is an if or a tagless switch with a check whose matching branch
-// returns, so the error isn't the library type after it.
-func returnsWhenMatched(st ast.Stmt, check typeCheck) bool {
+// typeCaseRulesOut is caseRulesOut for a type switch on the error: an earlier case (any other, for
+// default) lists the library error type, and type switch cases can't fall through.
+func (ef *errFlow) typeCaseRulesOut(cc *ast.CaseClause, prev ast.Node, caseCheck typeCaseCheck) bool {
+	st, isStmt := prev.(ast.Stmt)
+	body, _ := ef.pi.parents[cc].(*ast.BlockStmt)
+	if !isStmt || body == nil || !slices.Contains(cc.Body, st) {
+		return false
+	}
+	sw, _ := ef.pi.parents[body].(*ast.TypeSwitchStmt)
+	if sw == nil {
+		return false
+	}
+	for _, c := range sw.Body.List {
+		other := c.(*ast.CaseClause)
+		if other == cc {
+			if cc.List != nil {
+				break
+			}
+			continue
+		}
+		if caseCheck(sw, other) {
+			return true
+		}
+	}
+	return false
+}
+
+// typeCaseCheck reports whether cc, a case of sw, lists the library error type for the error being
+// classified, in a type switch on that error made after it was last assigned.
+type typeCaseCheck func(sw *ast.TypeSwitchStmt, cc *ast.CaseClause) bool
+
+// typeSwitchOn reports whether sw switches on v's type: `switch v.(type)` or `switch x := v.(type)`.
+func (ef *errFlow) typeSwitchOn(sw *ast.TypeSwitchStmt, v types.Object) bool {
+	var x ast.Expr
+	switch a := sw.Assign.(type) {
+	case *ast.ExprStmt:
+		x = a.X
+	case *ast.AssignStmt:
+		if len(a.Rhs) == 1 {
+			x = a.Rhs[0]
+		}
+	}
+	ta, ok := unparen(x).(*ast.TypeAssertExpr)
+	if !ok {
+		return false
+	}
+	id, ok := unparen(ta.X).(*ast.Ident)
+	return ok && ef.info.Uses[id] == v
+}
+
+func (ef *errFlow) listsLibType(cc *ast.CaseClause) bool {
+	for _, e := range cc.List {
+		if t := ef.info.TypeOf(e); t != nil && ef.libErrorType(t) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// returnsWhenMatched reports whether st is an if, a tagless switch or a type switch with a check whose
+// matching branch can't complete normally, so the error isn't the library type after it.
+func returnsWhenMatched(st ast.Stmt, check typeCheck, caseCheck typeCaseCheck) bool {
 	switch s := st.(type) {
 	case *ast.IfStmt:
 		negated, ok := check(s.Cond, s.Init)
-		return ok && !negated && endsInReturn(s.Body.List)
+		return ok && !negated && terminates(s.Body.List)
 	case *ast.SwitchStmt:
 		if s.Tag != nil {
 			return false
 		}
 		for _, c := range s.Body.List {
-			if cc := c.(*ast.CaseClause); matchesCase(cc, s.Init, check) && endsInReturn(cc.Body) {
+			if cc := c.(*ast.CaseClause); matchesCase(cc, s.Init, check) && terminates(cc.Body) {
+				return true
+			}
+		}
+	case *ast.TypeSwitchStmt:
+		for _, c := range s.Body.List {
+			if cc := c.(*ast.CaseClause); caseCheck(s, cc) && terminates(cc.Body) {
 				return true
 			}
 		}
@@ -233,13 +301,14 @@ func stmtList(n ast.Node) []ast.Stmt {
 }
 
 // libTypeCheck matches a condition that checks v for a library error type, possibly negated:
-// errors.As(v, &target), or the ok of `target, ok := errors.AsType[T](v)` in init. It returns the
-// errors.As or errors.AsType call, or nil.
-func (ef *errFlow) libTypeCheck(cond ast.Expr, init ast.Stmt, v types.Object) (call *ast.CallExpr, negated bool) {
+// errors.As(v, &target), or the ok of `target, ok := errors.AsType[T](v)` or `target, ok := v.(T)` in
+// init. It returns the errors.As or errors.AsType call or the type assertion, or nil.
+func (ef *errFlow) libTypeCheck(cond ast.Expr, init ast.Stmt, v types.Object) (found ast.Expr, negated bool) {
 	cond = unparen(cond)
 	if u, isNot := cond.(*ast.UnaryExpr); isNot && u.Op == token.NOT {
 		negated, cond = true, unparen(u.X)
 	}
+	var call *ast.CallExpr
 	switch c := cond.(type) {
 	case *ast.CallExpr:
 		call = c
@@ -250,6 +319,13 @@ func (ef *errFlow) libTypeCheck(cond ast.Expr, init ast.Stmt, v types.Object) (c
 		}
 		if id, isIdent := as.Lhs[1].(*ast.Ident); !isIdent || ef.info.ObjectOf(id) != ef.info.ObjectOf(c) {
 			return nil, false
+		}
+		if ta, isAssert := unparen(as.Rhs[0]).(*ast.TypeAssertExpr); isAssert && ta.Type != nil {
+			id, isIdent := unparen(ta.X).(*ast.Ident)
+			if !isIdent || ef.info.Uses[id] != v || ef.libErrorType(ef.info.TypeOf(ta.Type)) == nil {
+				return nil, false
+			}
+			return ta, negated
 		}
 		call, _ = unparen(as.Rhs[0]).(*ast.CallExpr)
 	}
@@ -276,12 +352,106 @@ func (ef *errFlow) libTypeCheck(cond ast.Expr, init ast.Stmt, v types.Object) (c
 	return call, negated
 }
 
-func endsInReturn(list []ast.Stmt) bool {
+// terminates reports whether a statement list ends in a terminating statement as the Go spec defines
+// it: control can't reach the end of the list.
+func terminates(list []ast.Stmt) bool {
 	if len(list) == 0 {
 		return false
 	}
-	_, ok := list[len(list)-1].(*ast.ReturnStmt)
-	return ok
+	return isTerminating(list[len(list)-1], "")
+}
+
+func isTerminating(st ast.Stmt, label string) bool {
+	switch s := st.(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.BranchStmt:
+		return s.Tok == token.GOTO
+	case *ast.ExprStmt:
+		call, ok := unparen(s.X).(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		id, ok := unparen(call.Fun).(*ast.Ident)
+		return ok && id.Name == "panic"
+	case *ast.BlockStmt:
+		return terminates(s.List)
+	case *ast.LabeledStmt:
+		return isTerminating(s.Stmt, s.Label.Name)
+	case *ast.IfStmt:
+		if s.Else == nil || !terminates(s.Body.List) {
+			return false
+		}
+		return isTerminating(s.Else, "")
+	case *ast.ForStmt:
+		return s.Cond == nil && !hasBreak(s.Body, label)
+	case *ast.SwitchStmt:
+		return clausesTerminate(s.Body, label)
+	case *ast.TypeSwitchStmt:
+		return clausesTerminate(s.Body, label)
+	case *ast.SelectStmt:
+		for _, c := range s.Body.List {
+			cc := c.(*ast.CommClause)
+			if !terminates(cc.Body) || hasBreakIn(cc.Body, label) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func clausesTerminate(body *ast.BlockStmt, label string) bool {
+	hasDefault := false
+	for _, c := range body.List {
+		cc := c.(*ast.CaseClause)
+		if cc.List == nil {
+			hasDefault = true
+		}
+		if !terminates(cc.Body) && !endsInFallthrough(cc.Body) || hasBreakIn(cc.Body, label) {
+			return false
+		}
+	}
+	return hasDefault
+}
+
+func hasBreakIn(list []ast.Stmt, label string) bool {
+	for _, st := range list {
+		if hasBreak(st, label) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasBreak reports whether n has a break that leaves the statement it's in: an unlabeled one outside
+// any nested loop, switch or select, or one with label.
+func hasBreak(n ast.Node, label string) bool {
+	found := false
+	var walk func(n ast.Node, nested bool)
+	walk = func(n ast.Node, nested bool) {
+		ast.Inspect(n, func(c ast.Node) bool {
+			if found || c == nil {
+				return false
+			}
+			switch x := c.(type) {
+			case *ast.FuncLit:
+				return false
+			case *ast.BranchStmt:
+				if x.Tok == token.BREAK && (x.Label == nil && !nested || x.Label != nil && x.Label.Name == label && label != "") {
+					found = true
+				}
+			case *ast.ForStmt, *ast.RangeStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.SelectStmt:
+				if !nested {
+					walk(c, true)
+					return false
+				}
+			}
+			return true
+		})
+	}
+	walk(n, false)
+	return found
 }
 
 func endsInFallthrough(list []ast.Stmt) bool {

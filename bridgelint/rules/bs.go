@@ -48,6 +48,9 @@ type stateLit struct {
 	hasCode    bool
 	codeOK     bool // code is a constant
 	action     string
+	// escapes is set when the state's variable is handed to code that can set its fields: its address is
+	// taken, or a pointer to it is passed to a call.
+	escapes bool
 }
 
 func runBS(pass *analysis.Pass) (any, error) {
@@ -169,10 +172,15 @@ func collectStateLits(pass *analysis.Pass, pi *pkgInfo) []*stateLit {
 // mergeLaterAssignments folds `state.Field = x` assignments in the same function into the literal's fields.
 func mergeLaterAssignments(pass *analysis.Pass, pi *pkgInfo, sl *stateLit) {
 	var v types.Object
-	switch p := pi.parents[sl.lit].(type) {
+	var value ast.Expr = sl.lit
+	isPtr := false
+	if u, ok := pi.parents[sl.lit].(*ast.UnaryExpr); ok && u.Op == token.AND {
+		value, isPtr = u, true
+	}
+	switch p := pi.parents[value].(type) {
 	case *ast.AssignStmt:
 		for i, rhs := range p.Rhs {
-			if rhs == sl.lit && i < len(p.Lhs) {
+			if rhs == value && i < len(p.Lhs) {
 				if id, ok := p.Lhs[i].(*ast.Ident); ok {
 					v = pass.TypesInfo.ObjectOf(id)
 				}
@@ -180,7 +188,7 @@ func mergeLaterAssignments(pass *analysis.Pass, pi *pkgInfo, sl *stateLit) {
 		}
 	case *ast.ValueSpec:
 		for i, val := range p.Values {
-			if val == sl.lit && i < len(p.Names) {
+			if val == value && i < len(p.Names) {
 				v = pass.TypesInfo.ObjectOf(p.Names[i])
 			}
 		}
@@ -188,7 +196,21 @@ func mergeLaterAssignments(pass *analysis.Pass, pi *pkgInfo, sl *stateLit) {
 	if v == nil || sl.fn == nil {
 		return
 	}
+	isV := func(e ast.Expr) bool {
+		id, ok := unparen(e).(*ast.Ident)
+		return ok && pass.TypesInfo.ObjectOf(id) == v
+	}
 	inspectFunc(funcBody(sl.fn), func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.UnaryExpr:
+			if x.Op == token.AND && isV(x.X) {
+				sl.escapes = true
+			}
+		case *ast.CallExpr:
+			if isPtr && slices.ContainsFunc(x.Args, isV) {
+				sl.escapes = true
+			}
+		}
 		as, ok := n.(*ast.AssignStmt)
 		if !ok {
 			return true
@@ -225,7 +247,7 @@ func checkStateLit(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, s
 	}
 
 	// BS003
-	if msg, ok := sl.fields["Message"]; ok && exprShowsError(pass.Pkg, info, msg) {
+	if msg, ok := sl.fields["Message"]; ok && exprShowsError(pass, msg) {
 		var opts []reportOpt
 		note := "move the raw error to Info[\"go_error\"] and write a human message"
 		if sl.codeOK && keys[sl.code] {
@@ -238,7 +260,7 @@ func checkStateLit(pass *analysis.Pass, pi *pkgInfo, ef *errFlow, cfg *Config, s
 	// BS004
 	if isErrorState {
 		switch {
-		case !sl.hasCode:
+		case !sl.hasCode && !sl.escapes:
 			report(pass, lit, BS004, fmt.Sprintf("%s state has no Error code; give it a stable <net>-<reason> code", sl.event))
 		case sl.codeOK && sl.code == "":
 			report(pass, lit, BS004, fmt.Sprintf("%s state has an empty Error code", sl.event))

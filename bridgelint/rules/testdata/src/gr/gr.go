@@ -152,6 +152,7 @@ func (c *Client) remember(k string) {
 
 func (c *Client) GetCapabilities(ctx context.Context, isDM bool) *event.RoomFeatures {
 	caps := &event.RoomFeatures{ID: "com.example.capabilities.v1", MaxTextSize: 4000}
+	caps.MaxTextSize = 4096
 	if isDM {
 		caps.Edit = 1 // want `GR011: GetCapabilities changes Edit but keeps the same RoomFeatures.ID`
 	}
@@ -180,3 +181,21 @@ func headerFromWrapper(ctx context.Context, a *apiRequest) string {
 	}
 	return resp.Header.Get("X-ID")
 }
+
+var (
+	emojiOnce  sync.Once
+	emojiMap   map[string]string
+	emojiNames []string
+)
+
+func lookupEmoji(s string) string {
+	emojiOnce.Do(func() {
+		emojiMap = map[string]string{"a": "b"}
+	})
+	return emojiMap[s]
+}
+
+var loadEmojiNames = sync.OnceValue(func() []string {
+	emojiNames = append(emojiNames, "a")
+	return emojiNames
+})

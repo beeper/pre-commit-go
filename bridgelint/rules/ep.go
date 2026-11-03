@@ -39,16 +39,16 @@ func runEP(pass *analysis.Pass) (any, error) {
 					checkDroppedDecode(pass, funcBody(x))
 				}
 			case *ast.BinaryExpr:
-				if (x.Op == token.EQL || x.Op == token.NEQ) && (isErrText(x.X) && !isEmptyString(info, x.Y) || isErrText(x.Y) && !isEmptyString(info, x.X)) {
+				if (x.Op == token.EQL || x.Op == token.NEQ) && (isErrText(x.X) && isTextConst(info, x.Y) || isErrText(x.Y) && isTextConst(info, x.X)) {
 					report(pass, x, EP001, "error matched by comparing err.Error(); use errors.Is/errors.As or a typed code accessor")
 				}
 			case *ast.SwitchStmt:
-				if x.Tag != nil && isErrText(x.Tag) {
+				if x.Tag != nil && isErrText(x.Tag) && hasTextCase(info, x) {
 					report(pass, x.Tag, EP001, "switch on err.Error(); use errors.Is/errors.As or a typed code accessor")
 				}
 			case *ast.CallExpr:
 				obj := calleeObj(info, x)
-				if isPkgFunc(obj, "strings", "EqualFold") && len(x.Args) > 0 && isErrText(x.Args[0]) {
+				if isPkgFunc(obj, "strings", "EqualFold") && len(x.Args) == 2 && (isErrText(x.Args[0]) && isTextConst(info, x.Args[1]) || isErrText(x.Args[1]) && isTextConst(info, x.Args[0])) {
 					report(pass, x, EP001, "error matched with strings.EqualFold(err.Error(), ...); use errors.Is/errors.As or a typed code accessor")
 				}
 				if !pi.isBridge && pass.Pkg.Name() != "main" && isPkgFunc(obj, "fmt", "Errorf") {
@@ -166,4 +166,22 @@ func isNilIdent(info *types.Info, e ast.Expr) bool {
 	}
 	_, isNil := info.Uses[id].(*types.Nil)
 	return isNil
+}
+
+// isTextConst reports whether e is a non-empty constant string, the fixed text an error is matched against.
+// Comparing two errors' text, or one with a value from elsewhere, isn't matching on a message.
+func isTextConst(info *types.Info, e ast.Expr) bool {
+	s, ok := constString(info, e)
+	return ok && s != ""
+}
+
+func hasTextCase(info *types.Info, sw *ast.SwitchStmt) bool {
+	for _, c := range sw.Body.List {
+		for _, e := range c.(*ast.CaseClause).List {
+			if isTextConst(info, e) {
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -65,7 +65,24 @@ func (c *Client) states(err error) {
 	state.Error = "ex-later"
 	state.Message = "set later"
 	c.UserLogin.BridgeState.Send(state)
+
+	ptr := &status.BridgeState{StateEvent: status.StateTransientDisconnect}
+	ptr.Error = "ex-pointer"
+	ptr.Message = "set through a pointer"
+	c.UserLogin.BridgeState.Send(*ptr)
+
+	helped := status.BridgeState{StateEvent: status.StateUnknownError, Message: "set by a helper"}
+	setCode(&helped)
+	c.UserLogin.BridgeState.Send(helped)
+
+	byValue := status.BridgeState{StateEvent: status.StateUnknownError, Message: "copied"} // want `BS004: UNKNOWN_ERROR state has no Error code`
+	logState(byValue)
+	c.UserLogin.BridgeState.Send(byValue)
 }
+
+func setCode(s *status.BridgeState) { s.Error = "ex-helper" }
+
+func logState(s status.BridgeState) {}
 
 func (c *Client) pollLoop(ctx context.Context) {
 	for {

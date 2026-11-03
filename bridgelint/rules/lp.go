@@ -63,15 +63,15 @@ func isRespErrorType(t types.Type) bool {
 }
 
 type respErr struct {
-	node       ast.Node
-	lit        *ast.CompositeLit
-	fields     map[string]ast.Expr
-	code       string
-	codeKnown  bool
-	msg        string
-	status     ast.Expr
-	statusVal  int64
-	statusKnow bool
+	node        ast.Node
+	lit         *ast.CompositeLit
+	fields      map[string]ast.Expr
+	code        string
+	codeKnown   bool
+	msg         string
+	status      ast.Expr
+	statusVal   int64
+	statusKnown bool
 }
 
 func runLP(pass *analysis.Pass) (any, error) {
@@ -151,7 +151,7 @@ func parseRespErrLit(info *types.Info, lit *ast.CompositeLit) *respErr {
 	}
 	if e, ok := re.fields["StatusCode"]; ok {
 		re.status = e
-		re.statusVal, re.statusKnow = constInt(info, e)
+		re.statusVal, re.statusKnown = constInt(info, e)
 	}
 	return re
 }
@@ -177,12 +177,12 @@ func checkRespErrLit(pass *analysis.Pass, pi *pkgInfo, file *ast.File, lit *ast.
 	info := pass.TypesInfo
 	re := parseRespErrLit(info, lit)
 	// LP002
-	if re.statusKnow && !isTrue(info, re.fields["CanRetry"]) && !retriesWanted(pi, info, lit) {
+	if re.statusKnown && !isTrue(info, re.fields["CanRetry"]) && !retriesWanted(pi, info, lit) {
 		checkStatusArg(pass, file, re.status, re.statusVal, re.code == "M_LIMIT_EXCEEDED")
 	}
 
 	// LP004
-	if re.status != nil && !re.statusKnow && isPassthroughStatus(pass, re.status) {
+	if re.status != nil && !re.statusKnown && isPassthroughStatus(pass, re.status) {
 		report(pass, re.status, LP004, "HTTP status copied from a network error code; map it to a fixed status (400 with M_LIMIT_EXCEEDED for rate limits, 401/403 for auth, 500 for upstream)")
 	}
 
@@ -289,12 +289,12 @@ func lp007Fix(pass *analysis.Pass, pi *pkgInfo, file *ast.File, re *respErr, var
 	if e, ok := re.fields["Err"]; ok {
 		b.WriteString(".WithMessage(" + nodeText(pass, e) + ")")
 	}
-	sends429 := re.status == nil && defaultStatus == 429 || re.statusKnow && re.statusVal == 429
+	sends429 := re.status == nil && defaultStatus == 429 || re.statusKnown && re.statusVal == 429
 	switch {
 	case re.code == "M_LIMIT_EXCEEDED" && sends429 && !retriesWanted(pi, pass.TypesInfo, re.lit):
 		// mautrix.MLimitExceeded is 429, which LP002 rejects.
 		b.WriteString(".WithStatus(" + statusBadRequest(file) + ")")
-	case re.status != nil && !(re.statusKnow && re.statusVal == int64(defaultStatus)):
+	case re.status != nil && !(re.statusKnown && re.statusVal == int64(defaultStatus)):
 		b.WriteString(".WithStatus(" + nodeText(pass, re.status) + ")")
 	}
 	text := b.String()
@@ -552,13 +552,18 @@ func loginFieldPatterns(pass *analysis.Pass) map[string]bool {
 // method chain that calls WithCanRetry(true). Media fetches are safe to retry, and WithCanRetry(true)
 // marks a deliberate retry (e.g. direct media waiting on a phone), not a provisioning failure.
 func retriesWanted(pi *pkgInfo, info *types.Info, e ast.Expr) bool {
+	inFunc := false
 	for p := pi.parents[e]; p != nil; p = pi.parents[p] {
 		if fd, ok := p.(*ast.FuncDecl); ok {
 			if pi.scopes[fd]&ScopeDirectMedia != 0 {
 				return true
 			}
+			inFunc = true
 			break
 		}
+	}
+	if !inFunc && usedOnlyInDirectMedia(pi, info, e) {
+		return true
 	}
 	isCanRetry := func(call *ast.CallExpr, sel *ast.SelectorExpr) bool {
 		return sel.Sel.Name == "WithCanRetry" && len(call.Args) == 1 && isTrue(info, call.Args[0])
@@ -600,4 +605,51 @@ func isTrue(info *types.Info, e ast.Expr) bool {
 	}
 	tv, ok := info.Types[e]
 	return ok && tv.Value != nil && tv.Value.Kind() == constant.Bool && constant.BoolVal(tv.Value)
+}
+
+// usedOnlyInDirectMedia reports whether e initialises a package-level variable that only direct media
+// functions use, like a shared "not ready" error that Download returns.
+func usedOnlyInDirectMedia(pi *pkgInfo, info *types.Info, e ast.Expr) bool {
+	var spec *ast.ValueSpec
+	for p := pi.parents[e]; p != nil && spec == nil; p = pi.parents[p] {
+		switch x := p.(type) {
+		case *ast.ValueSpec:
+			spec = x
+		case *ast.FuncLit, *ast.FuncDecl:
+			return false
+		}
+	}
+	if spec == nil {
+		return false
+	}
+	objs := map[types.Object]bool{}
+	for _, n := range spec.Names {
+		if obj, ok := info.Defs[n].(*types.Var); ok && obj.Parent() == obj.Pkg().Scope() {
+			objs[obj] = true
+		}
+	}
+	if len(objs) == 0 {
+		return false
+	}
+	used := false
+	for id, obj := range info.Uses {
+		if !objs[obj] {
+			continue
+		}
+		used = true
+		fd := enclosingFuncDecl(pi, id)
+		if fd == nil || pi.scopes[fd]&ScopeDirectMedia == 0 {
+			return false
+		}
+	}
+	return used
+}
+
+func enclosingFuncDecl(pi *pkgInfo, n ast.Node) *ast.FuncDecl {
+	for p := pi.parents[n]; p != nil; p = pi.parents[p] {
+		if fd, ok := p.(*ast.FuncDecl); ok {
+			return fd
+		}
+	}
+	return nil
 }

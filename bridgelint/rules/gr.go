@@ -48,9 +48,8 @@ func runGR(pass *analysis.Pass) (any, error) {
 	if pi.isBridge {
 		checkSharedState(pass, pi)
 		checkCapabilitiesID(pass, pi)
-		if FrameworkHas(FeatureDisconnectAfterLogout) {
-			// Newer bridgev2 disconnects after LogoutRemote itself.
-		} else {
+		// Newer bridgev2 disconnects after LogoutRemote itself.
+		if FrameworkLacks(FeatureDisconnectAfterLogout) {
 			checkLogoutRemote(pass, pi)
 		}
 	}
@@ -363,9 +362,12 @@ func checkSharedState(pass *analysis.Pass, pi *pkgInfo) {
 		if isTestFile(pass, fd) {
 			continue
 		}
+		onceLits := map[*ast.FuncLit]bool{}
 		ast.Inspect(fd.Body, func(n ast.Node) bool {
 			var targets []ast.Expr
 			switch x := n.(type) {
+			case *ast.FuncLit:
+				return !onceLits[x]
 			case *ast.AssignStmt:
 				if x.Tok == token.DEFINE {
 					return true
@@ -374,8 +376,16 @@ func checkSharedState(pass *analysis.Pass, pi *pkgInfo) {
 			case *ast.IncDecStmt:
 				targets = []ast.Expr{x.X}
 			case *ast.CallExpr:
-				if obj := calleeObj(info, x); (obj == types.Universe.Lookup("delete") || obj == types.Universe.Lookup("clear")) && len(x.Args) > 0 {
+				obj := calleeObj(info, x)
+				if (obj == types.Universe.Lookup("delete") || obj == types.Universe.Lookup("clear")) && len(x.Args) > 0 {
 					targets = []ast.Expr{x.Args[0]}
+				}
+				if isOnceCall(obj) {
+					for _, arg := range x.Args {
+						if lit, ok := unparen(arg).(*ast.FuncLit); ok {
+							onceLits[lit] = true
+						}
+					}
 				}
 			}
 			for _, t := range targets {
@@ -389,6 +399,23 @@ func checkSharedState(pass *analysis.Pass, pi *pkgInfo) {
 			return true
 		})
 	}
+}
+
+// isOnceCall matches (*sync.Once).Do, sync.OnceFunc, sync.OnceValue and sync.OnceValues. A write in the
+// function they run is a lazy initialisation that happens once, before any reader sees the value.
+func isOnceCall(obj types.Object) bool {
+	f, ok := obj.(*types.Func)
+	if !ok || f.Pkg() == nil || f.Pkg().Path() != "sync" {
+		return false
+	}
+	if sig, ok := f.Type().(*types.Signature); ok && sig.Recv() != nil {
+		return f.Name() == "Do" && recvTypeName(sig) == "Once"
+	}
+	switch f.Name() {
+	case "OnceFunc", "OnceValue", "OnceValues":
+		return true
+	}
+	return false
 }
 
 func rootPkgVar(info *types.Info, pkg *types.Package, e ast.Expr) *types.Var {
@@ -448,7 +475,7 @@ func checkCapabilitiesID(pass *analysis.Pass, pi *pkgInfo) {
 				}
 				if sel.Sel.Name == "ID" {
 					idSet = true
-				} else if mutation == nil {
+				} else if mutation == nil && isConditional(pi, fd, as) {
 					mutation, mutatedField = as, sel.Sel.Name
 				}
 			}
@@ -458,6 +485,18 @@ func checkCapabilitiesID(pass *analysis.Pass, pi *pkgInfo) {
 			report(pass, mutation, GR011, fmt.Sprintf("GetCapabilities changes %s but keeps the same RoomFeatures.ID; clients cache features by ID, so give each variant its own ID", mutatedField))
 		}
 	}
+}
+
+// isConditional reports whether n only runs on some calls of fd: it's inside an if, switch, select or
+// loop. A change made on every call gives every result the same features, so one ID still fits.
+func isConditional(pi *pkgInfo, fd *ast.FuncDecl, n ast.Node) bool {
+	for p := pi.parents[n]; p != nil && p != fd; p = pi.parents[p] {
+		switch p.(type) {
+		case *ast.IfStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.SelectStmt, *ast.ForStmt, *ast.RangeStmt, *ast.FuncLit:
+			return true
+		}
+	}
+	return false
 }
 
 // checkLogoutRemote implements GR013.

@@ -5,17 +5,27 @@ import (
 
 	"example.com/crossmod/conv"
 	"example.com/crossmod/db"
+	"example.com/crossmod/errs"
 	"example.com/crossmod/lib"
+	"example.com/jobq"
 	"example.com/netlib"
 	"example.com/netlib/memstore"
 	"example.com/netlib/wstransport"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/event"
 )
 
+// MessageStore is implemented by a package this one doesn't import, wired up in main.
+type MessageStore interface {
+	GetMessage(ctx context.Context, id string) (string, error)
+}
+
 type Client struct {
-	lib *lib.Client
-	net *netlib.Client
-	db  *db.Store
+	lib   *lib.Client
+	net   *netlib.Client
+	db    *db.Store
+	store MessageStore
+	queue *jobq.Queue
 }
 
 var _ bridgev2.NetworkAPI = (*Client)(nil)
@@ -91,6 +101,19 @@ func (c *Client) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixR
 	}
 	if err := c.net.Stream(ctx, nil); err != nil {
 		return err // want `MSS001: HandleMatrixReaction returns raw error from netlib.Stream;`
+	}
+	return nil
+}
+
+func (c *Client) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.MatrixMessageRemove) error { // want HandleMatrixMessageRemove:"^ msg=\"\" callee=. statuses=true"
+	if _, err := c.store.GetMessage(ctx, "x"); err != nil {
+		return err
+	}
+	if err := c.queue.Do(&jobq.Request{Name: "x"}); err != nil {
+		return err
+	}
+	if err := c.net.Publish(ctx, nil); err != nil {
+		return bridgev2.WrapErrorInStatus(err).WithMessage(errs.NoticeError{Notice: "x"}.Error()).WithErrorReason(event.MessageStatusNetworkError)
 	}
 	return nil
 }

@@ -236,8 +236,11 @@ func mautrixVersion() string {
 	default:
 		return mod.Version
 	}
+	if dir == "" {
+		return "local"
+	}
 	commitTime, err := exec.Command("git", "-C", dir, "log", "-1", "--format=%cI").Output()
-	if dir == "" || err != nil {
+	if err != nil {
 		return "local"
 	}
 	return "local@" + strings.TrimSpace(string(commitTime))

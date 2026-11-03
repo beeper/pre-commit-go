@@ -363,7 +363,7 @@ func funcType(info *types.Info, fn ast.Node) *types.Signature {
 }
 
 // inspectFunc walks a function body without descending into nested function literals.
-func inspectFunc(body ast.Node, fn func(ast.Node) bool) {
+func inspectFunc(body *ast.BlockStmt, fn func(ast.Node) bool) {
 	if body == nil {
 		return
 	}

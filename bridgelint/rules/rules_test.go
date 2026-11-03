@@ -99,7 +99,9 @@ func TestDisconnectEventsAddToDefaults(t *testing.T) {
 
 // TestCrossPackage runs in module mode, where errors are followed into other packages of the module.
 func TestCrossPackage(t *testing.T) {
-	analysistest.Run(t, filepath.Join(analysistest.TestData(), "crossmod"), MSSAnalyzer, "./...")
+	dir := filepath.Join(analysistest.TestData(), "crossmod")
+	analysistest.Run(t, dir, MSSAnalyzer, "./connector", "./conv", "./db", "./errs", "./lib")
+	analysistest.Run(t, dir, BSAnalyzer, "./state")
 }
 
 func TestLP(t *testing.T) {
@@ -122,7 +124,11 @@ func TestEP(t *testing.T) {
 }
 
 func TestGR(t *testing.T) {
+	defer func() { MautrixVersion = "" }()
+	MautrixVersion = "v0.32.0"
 	analysistest.Run(t, analysistest.TestData(), GRAnalyzer, "gr")
+	MautrixVersion = ""
+	analysistest.Run(t, analysistest.TestData(), GRAnalyzer, "grunknown")
 }
 
 func TestMC(t *testing.T) {
