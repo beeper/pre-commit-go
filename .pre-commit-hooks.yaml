@@ -22,3 +22,12 @@
   entry: banglobalzerolog
   language: golang
   types_or: [ go ]
+- id: bridgelint
+  name: bridgelint
+  description: Check mautrix bridgev2 bridges for error-reporting and reliability mistakes
+  entry: bridgelint
+  args: [./...]
+  language: golang
+  types_or: [ go ]
+  pass_filenames: false
+  require_serial: true

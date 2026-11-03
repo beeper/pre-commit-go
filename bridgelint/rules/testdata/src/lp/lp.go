@@ -1,0 +1,188 @@
+package lp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"regexp"
+
+	"example.com/netlib"
+	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/bridgev2"
+)
+
+type Client struct{ client *netlib.Client }
+
+var _ bridgev2.IdentifierResolvingNetworkAPI = (*Client)(nil)
+
+func (c *Client) Connect(ctx context.Context)      {}
+func (c *Client) Disconnect()                      {}
+func (c *Client) IsLoggedIn() bool                 { return true }
+func (c *Client) LogoutRemote(ctx context.Context) { c.client.Disconnect() }
+func (c *Client) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
+	return nil, bridgev2.ErrUnsupportedMessageType
+}
+
+func (c *Client) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
+	if identifier == "" {
+		return nil, fmt.Errorf("invalid identifier")
+	}
+	if identifier == "bad" {
+		return nil, bridgev2.RespError(mautrix.MInvalidParam.WithMessage("invalid identifier"))
+	}
+	_, err := c.client.Lookup(ctx, identifier)
+	if err != nil {
+		zlog.Err(err).Msg("lookup failed")
+	}
+	_, err = c.client.Lookup(ctx, identifier)
+	if err != nil {
+		return nil, bridgev2.WrapRespErr(err, mautrix.MNotFound)
+	}
+	_, err = c.client.Lookup(ctx, identifier)
+	if err != nil {
+		return nil, err // want `LP001: ResolveIdentifier returns raw error from netlib.Lookup`
+	}
+	_, err = c.client.Lookup(ctx, identifier)
+	switch {
+	case errors.Is(err, context.Canceled):
+		return nil, err
+	case errors.Is(err, ErrInvalidToken):
+		return nil, err
+	case err != nil:
+		return nil, err // want `LP001: ResolveIdentifier returns raw error from netlib.Lookup`
+	}
+	_, err = c.client.Lookup(ctx, identifier)
+	if errors.Is(err, context.Canceled) {
+		return nil, err
+	}
+	return &bridgev2.ResolveIdentifierResponse{}, nil
+}
+
+type Connector struct{}
+
+var _ bridgev2.NetworkConnector = (*Connector)(nil)
+
+func (c *Connector) GetLoginFlows() []bridgev2.LoginFlow { return nil }
+func (c *Connector) CreateLogin(ctx context.Context, user any, flowID string) (bridgev2.LoginProcess, error) {
+	switch flowID {
+	case "nested":
+		if c == nil {
+			return nil, errors.New("connector is missing")
+		}
+		return &TokenLogin{}, nil
+	case "token":
+		return &TokenLogin{}, nil
+	default:
+		return nil, errors.New("this login isn't available") // want `LP001: CreateLogin returns plain error "this login isn't available"`
+	}
+}
+
+type TokenLogin struct{}
+
+var _ bridgev2.LoginProcessUserInput = (*TokenLogin)(nil)
+
+var tokenRegex = regexp.MustCompile(`^xox[a-z]-.+$`)
+
+var tokenField = bridgev2.LoginInputDataField{ID: "token", Name: "Token", Pattern: `^xox[a-z]-.+$`}
+
+func (t *TokenLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) { return nil, nil }
+func (t *TokenLogin) Cancel()                                                {}
+func (t *TokenLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+	if !tokenRegex.MatchString(input["token"]) { // want `LP008: this check duplicates the Pattern on the login field`
+		return nil, ErrInvalidToken
+	}
+	if !(tokenRegex.MatchString)(input["token"]) { // want `LP008: this check duplicates the Pattern on the login field`
+		return nil, ErrInvalidToken
+	}
+	return nil, nil
+}
+
+var (
+	ErrInvalidToken  = bridgev2.RespError{ErrCode: "FI.MAU.EX.INVALID_TOKEN", Err: "Invalid token", StatusCode: http.StatusBadRequest}
+	ErrRateLimited   = bridgev2.RespError{ErrCode: "FI.MAU.EX.RATE_LIMITED", Err: "Too many requests", StatusCode: http.StatusTooManyRequests} // want `LP002: RespError is sent as HTTP 429`
+	ErrRateLimitedOK = bridgev2.RespError{ErrCode: "FI.MAU.EX.RATE_LIMITED", Err: "Too many requests", StatusCode: http.StatusBadRequest}
+	ErrNoStatus      = bridgev2.RespError{ErrCode: "FI.MAU.EX.CAPTCHA", Err: "Captcha required"}                                                  // want `LP005: RespError literal without StatusCode`
+	ErrOutage        = bridgev2.RespError{ErrCode: "FI.MAU.EX.TEMPORARY_FAILURE", Err: "Server error", StatusCode: http.StatusServiceUnavailable} // want `LP002: RespError is sent as HTTP 503`
+	ErrUpstream      = bridgev2.RespError(mautrix.MUnknown.WithMessage("Upstream failed").WithStatus(502))                                        // want `LP002: RespError is sent as HTTP 502`
+	ErrUpstreamOK    = bridgev2.RespError(mautrix.MUnknown.WithMessage("Upstream failed"))
+	ErrPhoneTimeout  = mautrix.MNotFound.WithMessage("Phone did not respond").WithStatus(http.StatusGatewayTimeout).WithCanRetry(true)
+	ErrLimit         = mautrix.RespError{ErrCode: "M_LIMIT_EXCEEDED", Err: "Slow down", StatusCode: http.StatusBadRequest} // want `LP007: RespError literal for M_LIMIT_EXCEEDED`
+	ErrForbidden     = bridgev2.RespError{ErrCode: mautrix.MForbidden.ErrCode, Err: "Not allowed", StatusCode: 403}        // want `LP007: RespError literal for M_FORBIDDEN`
+	ErrLockedOut     = bridgev2.RespError{ErrCode: "FI.MAU.EX.LOCKED", Err: "Too many incorrect attempts, temporarily locked", StatusCode: 403}
+	ErrLimit2        = mautrix.MLimitExceeded.WithStatus(429)                              // want `LP002: RespError is sent as HTTP 429`
+	ErrLimit3        = bridgev2.RespError(mautrix.MLimitExceeded.WithMessage("Slow down")) // want `LP002: mautrix.MLimitExceeded is sent as HTTP 429 by default`
+	ErrLimit4        = mautrix.MLimitExceeded.WithMessage("Slow down").WithStatus(http.StatusBadRequest)
+	ErrLimit5        = mautrix.RespError{ErrCode: "M_LIMIT_EXCEEDED", Err: "Slow down"} // want `LP005: RespError literal without StatusCode` `LP007: RespError literal for M_LIMIT_EXCEEDED`
+)
+
+func isLimit(err error) bool { return errors.Is(err, mautrix.MLimitExceeded) }
+
+// The fix for a pointer literal would take the address of a call, so it's reported without one.
+var ErrForbiddenPtr = &mautrix.RespError{ErrCode: "M_FORBIDDEN", Err: "Not allowed", StatusCode: 403} // want `LP007: RespError literal for M_FORBIDDEN`
+
+// A JSON body's StatusCode isn't sent: the writer is given the status.
+func writeConflict(w http.ResponseWriter) {
+	writeJSON(w, http.StatusConflict, mautrix.RespError{ErrCode: "FI.MAU.EX.CONFLICT", Err: "conflict"})
+	writeJSON(w, http.StatusConflict, &mautrix.RespError{ErrCode: "FI.MAU.EX.CONFLICT", Err: "conflict"})
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {}
+
+func wrapConflict() error {
+	return wrapErr(mautrix.RespError{ErrCode: "FI.MAU.EX.CONFLICT", Err: "conflict"}) // want `LP005: RespError literal without StatusCode`
+}
+
+func wrapErr(err error) error { return err }
+
+func passthrough(err error) error {
+	var te *netlib.APIError
+	if errors.As(err, &te) {
+		return bridgev2.RespError{ErrCode: "FI.MAU.EX.UPSTREAM", Err: "upstream", StatusCode: te.Code} // want `LP004: HTTP status copied from a network error code`
+	}
+	return nil
+}
+
+func passthroughResponse(resp *http.Response) error {
+	return bridgev2.RespError{ErrCode: "FI.MAU.EX.UPSTREAM", Err: "upstream", StatusCode: resp.StatusCode} // want `LP004: HTTP status copied from a network error code`
+}
+
+// A status that isn't a protocol field is a deliberate choice, not a passthrough.
+func mappedStatus(internal int) error {
+	cfg := struct{ Code int }{internal}
+	return bridgev2.RespError{ErrCode: "FI.MAU.EX.UPSTREAM", Err: "upstream", StatusCode: cfg.Code}
+}
+
+type logger struct{}
+type logEvent struct{}
+
+func (logger) Err(err error) *logEvent { return &logEvent{} }
+func (*logEvent) Msg(msg string)       {}
+
+var zlog logger
+
+type GuardedLogin struct{ client *netlib.Client }
+
+var _ bridgev2.LoginProcess = (*GuardedLogin)(nil)
+
+func (g *GuardedLogin) Cancel() {}
+func (g *GuardedLogin) Start(ctx context.Context) (step *bridgev2.LoginStep, err error) {
+	defer func() {
+		if errors.Is(err, netlib.ErrRateLimited) {
+			err = ErrRateLimitedOK
+		}
+	}()
+	if err := g.client.Connect(ctx); errors.Is(err, ErrInvalidToken) {
+		return nil, err
+	}
+	var respErr bridgev2.RespError
+	if err := g.client.Connect(ctx); errors.As(err, &respErr) {
+		return nil, err
+	}
+	return nil, netlib.ErrRateLimited
+}
+
+func (c *Client) HandleMatrixViewLimitedMedia(ctx context.Context, msg *bridgev2.MatrixViewLimitedMedia) error {
+	_, err := c.client.Lookup(ctx, msg.Content)
+	return err // want `LP001: HandleMatrixViewLimitedMedia returns raw error from netlib.Lookup`
+}
