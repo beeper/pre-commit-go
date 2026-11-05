@@ -20,10 +20,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 
+	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/analysis/unitchecker"
 
 	"github.com/beeper/pre-commit-go/bridgelint/rules"
@@ -246,6 +249,98 @@ func mautrixVersion() string {
 	return "local@" + strings.TrimSpace(string(commitTime))
 }
 
+func goMinorVersion(version string) string {
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return version
+	}
+	return parts[0] + "." + parts[1]
+}
+
+func vetToolForGoVersion(exe string) (string, error) {
+	out, err := exec.Command("go", "env", "GOVERSION").Output()
+	if err != nil {
+		return "", fmt.Errorf("go env GOVERSION: %w", err)
+	}
+	goVersion := strings.TrimSpace(string(out))
+	if goMinorVersion(goVersion) == goMinorVersion(runtime.Version()) {
+		return exe, nil
+	}
+	exeHash, err := hashFile(exe)
+	if err != nil {
+		return "", err
+	}
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	binDir := filepath.Join(cacheDir, "bridgelint", exeHash[:16]+"-"+goVersion)
+	tool := filepath.Join(binDir, filepath.Base(exe))
+	if _, err = os.Stat(tool); err == nil {
+		return tool, nil
+	}
+
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "", fmt.Errorf("bridgelint was built with %s but go is %s; reinstall bridgelint with %s", runtime.Version(), goVersion, goVersion)
+	}
+	var build *exec.Cmd
+	if srcDir := moduleSourceDir(exe, info.Main.Path); srcDir != "" {
+		build = exec.Command("go", "build", "-o", tool, "."+strings.TrimPrefix(info.Path, info.Main.Path))
+		build.Dir = srcDir
+	} else if version := info.Main.Version; version != "" && version != "(devel)" && !strings.HasSuffix(version, "+dirty") {
+		build = exec.Command("go", "install", info.Path+"@"+version)
+		build.Dir = binDir
+	} else {
+		return "", fmt.Errorf("bridgelint was built with %s but go is %s; reinstall bridgelint with %s", runtime.Version(), goVersion, goVersion)
+	}
+	if err = os.MkdirAll(binDir, 0o755); err != nil {
+		return "", err
+	}
+	fmt.Fprintf(os.Stderr, "bridgelint: built with %s but go is %s, rebuilding it with %s\n", runtime.Version(), goVersion, goVersion)
+	build.Env = append(os.Environ(), "GOBIN="+binDir, "GOFLAGS=", "GOWORK=off")
+	if strings.HasPrefix(goVersion, "go") {
+		build.Env = append(build.Env, "GOTOOLCHAIN="+goVersion)
+	}
+	build.Stdout, build.Stderr = os.Stderr, os.Stderr
+	if err = build.Run(); err != nil {
+		return "", fmt.Errorf("bridgelint was built with %s but go is %s, and rebuilding it failed: %w", runtime.Version(), goVersion, err)
+	}
+	return tool, nil
+}
+
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err = io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func moduleSourceDir(exe, modulePath string) string {
+	if modulePath == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	for dir := filepath.Dir(exe); ; {
+		if data, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil && modfile.ModulePath(data) == modulePath {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
 func printRules() {
 	ids := make([]string, 0, len(rules.Rules))
 	for id := range rules.Rules {
@@ -270,6 +365,11 @@ func run(patterns []string) int {
 			fmt.Fprintf(os.Stderr, "bridgelint: %v\n", err)
 			return 2
 		}
+	}
+	exe, err = vetToolForGoVersion(exe)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bridgelint: %v\n", err)
+		return 2
 	}
 	mautrix := mautrixVersion()
 	cmd := exec.Command("go", append([]string{"vet", "-vettool=" + exe, "-json"}, patterns...)...)
