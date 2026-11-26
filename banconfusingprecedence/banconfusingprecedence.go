@@ -53,9 +53,10 @@ func isConfusing(parent, child token.Token) bool {
 	case pc == classBitwise && cc == classBitwise:
 		// a | b & c, a & b ^ c
 		return true
-	case (pc == classBitwise || pc == classShift) && cc == classArithmetic,
-		pc == classArithmetic && (cc == classBitwise || cc == classShift):
-		// a & b + c is (a & b) + c in Go but a & (b + c) in C
+	case pc == classBitwise && cc == classArithmetic,
+		pc == classArithmetic && cc == classBitwise:
+		// a & b + c is (a & b) + c in Go but a & (b + c) in C.
+		// Shifts mixed with arithmetic (1<<n - 1) are allowed, gofmt spacing makes them clear.
 		return true
 	case pc == classShift && cc == classBitwise,
 		(parent == token.AND || parent == token.AND_NOT) && cc == classShift:
