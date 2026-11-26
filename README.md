@@ -8,4 +8,5 @@ Beeper's pre-commit hooks for Go
 | `zerolog-use-stringer` | Use `Stringer(x, y)` instead of `Str(x, y.String())` |
 | `prevent-literal-http-methods` | Use `http.Method*` instead of literal method strings |
 | `zerolog-ban-global-log` | Ban the global `github.com/rs/zerolog/log` logger |
+| `ban-confusing-precedence` | Require parentheses when mixing `&&` with `\|\|`, different bitwise operators, bitwise with arithmetic, or `&` with shifts. Ignore a line with `// allow-confusing-precedence` |
 | `bridgelint` | Check mautrix bridgev2 bridges for error-reporting and reliability mistakes, see [bridgelint/README.md](bridgelint/README.md) |
