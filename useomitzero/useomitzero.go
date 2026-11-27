@@ -8,8 +8,10 @@ import (
 	"go/token"
 	"go/types"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -126,7 +128,11 @@ func loadTypedFields(files []string) map[tagKey]bool {
 			fmt.Fprintf(os.Stderr, "Failed to load packages in %s, falling back to syntactic checks: %v\n", root, err)
 			continue
 		}
+		warnedMismatch := false
 		for _, pkg := range pkgs {
+			if len(pkg.Errors) > 0 && !warnedMismatch {
+				warnedMismatch = warnToolchainMismatch(root)
+			}
 			if pkg.TypesInfo == nil {
 				continue
 			}
@@ -153,6 +159,25 @@ func loadTypedFields(files []string) map[tagKey]bool {
 		}
 	}
 	return result
+}
+
+// warnToolchainMismatch reports when the go command in dir is a different version than the one
+// this binary was built with (e.g. pre-commit reusing a cached build after a Go upgrade). The type
+// checker may then fail on parts of the code; those fields fall back to the syntactic check rather
+// than failing the hook.
+func warnToolchainMismatch(dir string) bool {
+	cmd := exec.Command("go", "env", "GOVERSION")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	goVersion := strings.TrimSpace(string(out))
+	if goVersion == runtime.Version() {
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "useomitzero was built with %s but go is %s, some fields may only be checked syntactically. Run `pre-commit clean` to rebuild the hook.\n", runtime.Version(), goVersion)
+	return true
 }
 
 // encoding/json/v2 only treats null, "", {} and [] as empty, so omitempty never omits
